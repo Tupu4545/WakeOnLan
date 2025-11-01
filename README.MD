@@ -55,6 +55,7 @@ AUTHORIZED_USER_IDS=123456789,987654321
 ```
 
 **How to get your User ID:**
+
 1. Start the bot without adding your ID
 2. Send `/start` to the bot
 3. The bot will show your User ID in the error message
@@ -91,6 +92,92 @@ Create a `devices.json` file (or use the bot's add device feature):
 python bot.py
 ```
 
+## ⚙️ Running 24/7 as a Service
+
+To keep your bot running continuously, you can set it up as a `systemd` service on Linux or a Task Scheduler job on Windows.
+
+### 🐧 Linux (Recommended)
+
+1. **Create a `systemd` service file**
+
+    Create and open a service file:
+
+    ```sh
+    sudo nano /etc/systemd/system/telegram-bot.service
+    ```
+
+    Paste this configuration:
+
+    ```ini
+    [Unit]
+    Description=Telegram Device Manager Bot
+    After=network.target
+
+    [Service]
+    Type=simple
+    WorkingDirectory=/home/yourusername/telegram-device-manager
+    ExecStart=/home/yourusername/telegram-device-manager/venv/bin/python /home/yourusername/telegram-device-manager/bot.py
+    Restart=always
+    RestartSec=10
+    User=yourusername
+    Environment=PYTHONUNBUFFERED=1
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+
+    > ⚠️ **Important:** Replace `/home/yourusername/telegram-device-manager` with your actual project path and `yourusername` with your username.
+
+2. **Enable and start the service**
+
+    ```sh
+    sudo systemctl daemon-reload
+    sudo systemctl enable telegram-bot.service
+    sudo systemctl start telegram-bot.service
+    ```
+
+3. **Check logs and status**
+
+    ```sh
+    sudo systemctl status telegram-bot.service
+    sudo journalctl -u telegram-bot.service -f
+    ```
+
+The bot will now auto-start on boot and restart automatically if it crashes.
+
+---
+
+### 🪟 Windows (Optional)
+
+If you’re running this on Windows, use Task Scheduler to keep it alive.
+
+1. **Create a `.bat` file**
+    Inside your project folder, create a file called `start_bot.bat`:
+
+    ```bat
+    @echo off
+    cd /d "C:\Path\To\telegram-device-manager"
+    call venv\Scripts\activate
+    python bot.py
+    ```
+
+    > ⚠️ **Note:** Replace `C:\Path\To\telegram-device-manager` with your actual project path.
+
+2. **Schedule it**
+    - Open **Task Scheduler**
+    - Click **Create Task**
+    - Under **General** tab:
+        - Name: `TelegramBot`
+        - Check **Run whether user is logged on or not**
+    - Go to **Triggers** → **New** → Begin the task: **At startup**
+    - Go to **Actions** → **New** → Program/script:
+        - `C:\Path\To\telegram-device-manager\start_bot.bat`
+    - Click OK, then right-click the task and **Run** to test it.
+
+> 💡 **Tip:** To restart automatically if it stops, you can also use “Repeat task every 5 minutes for a duration of indefinitely” under the **Triggers** tab.
+
+---
+
 ## 🔧 Configuration
 
 ### Device Configuration Fields
@@ -109,6 +196,7 @@ python bot.py
 For shutdown/restart commands to work, configure passwordless SSH:
 
 **Linux/macOS:**
+
 ```bash
 # Generate SSH key (if you don't have one)
 ssh-keygen -t rsa -b 4096
@@ -122,6 +210,7 @@ sudo visudo
 ```
 
 **Windows:**
+
 1. Install OpenSSH Server
 2. Configure SSH key authentication
 3. Ensure user has shutdown privileges
@@ -140,6 +229,7 @@ sudo visudo
 ### Device Commands
 
 For each device, you can use:
+
 - `/wake_devicename` - Wake device via WOL
 - `/shutdown_devicename` - Shutdown device
 - `/restart_devicename` - Restart device
@@ -178,23 +268,27 @@ Ubuntu-Server
 ## 🛠️ Troubleshooting
 
 ### Bot doesn't respond
+
 - Check if bot token is correct in `.env`
 - Verify your User ID is in `AUTHORIZED_USER_IDS`
 - Ensure bot is running without errors
 
 ### Wake-on-LAN not working
+
 - Verify MAC address is correct
 - Enable WOL in device BIOS/UEFI
 - Check if device supports WOL
 - Ensure device is on the same network
 
 ### SSH commands fail
+
 - Test SSH connection manually: `ssh user@device-ip`
 - Verify SSH key permissions (600 for private key)
 - Check sudoers configuration for passwordless commands
 - Ensure SSH service is running on target device
 
 ### Device doesn't wake up in time
+
 - Adjust timeout in code (default: 60 seconds)
 - Some devices take longer to boot
 - Check network latency
