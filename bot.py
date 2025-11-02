@@ -792,7 +792,7 @@ class DeviceBot:
                 return
             await asyncio.sleep(5)
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} did not start within 60 seconds\nCheck manually", context)
+        await self.update_status_message(user_id, chat_id, f"{device.name} did not start within 60 seconds❌\nCheck manually", context)
     
     async def _shutdown_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         shutdown_cmd = "shutdown /s /t 0" if device.os.lower() == 'windows' else "sudo -n /sbin/shutdown -h now"
@@ -805,17 +805,17 @@ class DeviceBot:
             await self.update_status_message(user_id, chat_id, f"Shutdown failed for {device.name}\nError: {output}", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"Shutdown command sent to {device.name}\nWaiting for device to go down...", context)
+        await self.update_status_message(user_id, chat_id, f"Shutdown command sent to {device.name}🟡\nWaiting for device to go down...", context)
         
         max_attempts = 12
         for attempt in range(max_attempts):
             await asyncio.sleep(5)
             is_up = await self.executor.ping_device(device.ip)
             if not is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is now DOWN", context)
+                await self.update_status_message(user_id, chat_id, f"{device.name} is now DOWN🛑", context)
                 return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} is still UP after 60 seconds\nCheck manually", context)
+        await self.update_status_message(user_id, chat_id, f"{device.name} is still UP after 60 seconds🟡\nCheck manually", context)
     
     async def _restart_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         restart_cmd = "shutdown /r /t 0" if device.os.lower() == 'windows' else "sudo -n reboot now"
@@ -841,20 +841,20 @@ class DeviceBot:
                 break
         
         if not down_detected:
-            await self.update_status_message(user_id, chat_id, f"{device.name} did not go down\nRestart may have failed", context)
+            await self.update_status_message(user_id, chat_id, f"{device.name} did not go down❌\nRestart may have failed", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} is down\nWaiting for device to come back up...", context)
+        await self.update_status_message(user_id, chat_id, f"{device.name} is down 🟡 \nWaiting for device to come back up...", context)
         
         max_attempts = 24
         for attempt in range(max_attempts):
             await asyncio.sleep(5)
             is_up = await self.executor.ping_device(device.ip)
             if is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is UP after restart", context)
+                await self.update_status_message(user_id, chat_id, f"{device.name} is UP ✅ after restart", context)
                 return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} did not come back up within 120 seconds\nCheck manually", context)
+        await self.update_status_message(user_id, chat_id, f"{device.name} did not come back up within 120 seconds❌\nCheck manually", context)
     
     async def _sleep_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         if device.os.lower() != 'windows':
@@ -871,14 +871,14 @@ class DeviceBot:
             await self.update_status_message(user_id, chat_id, f"Sleep failed for {device.name}\nError: {output}", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"Sleep command sent to {device.name}\nWaiting for device to sleep...", context)
+        await self.update_status_message(user_id, chat_id, f"Sleep command sent to {device.name}\nWaiting for device to sleep...💤", context)
         
         max_attempts = 12
         for attempt in range(max_attempts):
             await asyncio.sleep(5)
             is_up = await self.executor.ping_device(device.ip)
             if not is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is sleeping or down", context)
+                await self.update_status_message(user_id, chat_id, f"{device.name} is sleeping or down🛑", context)
                 return
         
         await self.update_status_message(user_id, chat_id, f"{device.name} is still UP after 60 seconds\nCheck manually", context)
@@ -889,14 +889,14 @@ class DeviceBot:
         is_ping_up = await self.executor.ping_device(device.ip)
         
         if is_ping_up:
-            await self.update_status_message(user_id, chat_id, f"{device.name} is UP (responds to ping)", context)
+            await self.update_status_message(user_id, chat_id, f"{device.name} is UP ✅ (responds to ping)", context)
         else:
             success, output = await self.executor.ssh_command(device, "echo 'SSH test'", timeout=5)
             
             if success:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is UP (SSH accessible, ping blocked)", context)
+                await self.update_status_message(user_id, chat_id, f"{device.name} is UP ✅(SSH accessible, ping blocked)", context)
             else:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is DOWN\nNo response to ping or SSH", context)
+                await self.update_status_message(user_id, chat_id, f"{device.name} is DOWN 🛑 \nNo response to ping or SSH", context)
     
     def create_device_command_handler(self, action: str, device_name: str) -> Callable:
         async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
