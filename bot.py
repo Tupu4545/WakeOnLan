@@ -3,7 +3,9 @@ import json
 import asyncio
 import re
 import sys
-from typing import Dict, List, Optional, Tuple, Callable
+import platform
+import logging
+from typing import Dict, List, Optional, Tuple, Callable, Set
 from pathlib import Path
 import ipaddress
 from dataclasses import dataclass
@@ -17,7 +19,32 @@ from telegram.ext import (
 from wakeonlan import send_magic_packet
 from dotenv import load_dotenv
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 ADD_NAME, ADD_IP, ADD_MAC, ADD_OS, ADD_USER, ADD_PORT, ADD_SSH_KEY = range(7)
+
+# Configuration constants
+class BotConfig:
+    """Bot configuration constants"""
+    WAKE_MAX_ATTEMPTS = 12
+    WAKE_CHECK_INTERVAL = 5
+    SHUTDOWN_MAX_ATTEMPTS = 12
+    SHUTDOWN_CHECK_INTERVAL = 5
+    RESTART_MAX_ATTEMPTS = 24
+    RESTART_CHECK_INTERVAL = 5
+    RESTART_DOWN_CHECK_ATTEMPTS = 6
+    RESTART_INITIAL_WAIT = 10
+    SLEEP_MAX_ATTEMPTS = 12
+    SLEEP_CHECK_INTERVAL = 5
 
 @dataclass
 class Device:
@@ -86,10 +113,13 @@ class ConfigManager:
         else:
             raise ValueError("AUTHORIZED_USER_IDS not set in .env file")
         
+        logger.info(f"Loaded configuration: {len(self.authorized_user_ids)} authorized users")
+        
     def _load_devices(self):
         if not self.devices_file.exists():
             with open(self.devices_file, "w") as f:
                 json.dump({}, f, indent=2)
+            logger.info("Created new devices.json file")
             return
         
         try:
@@ -110,19 +140,26 @@ class ConfigManager:
                     port=config.get('port', 22)
                 )
                 self.devices[name] = device
+                logger.debug(f"Loaded device: {name} ({device.ip})")
             except (KeyError, ValueError) as e:
-                print(f"Invalid device configuration for {name}: {e}")
+                logger.warning(f"Invalid device configuration for {name}: {e}")
                 continue
     
     def save_devices(self, backup: bool = True):
-        if backup and self.devices_file.exists():
-            backup_file = self.devices_file.with_suffix('.json.backup')
-            copy2(self.devices_file, backup_file)
-        
-        devices_dict = {name: device.to_dict() for name, device in self.devices.items()}
-        
-        with open(self.devices_file, 'w') as f:
-            json.dump(devices_dict, f, indent=2)
+        try:
+            if backup and self.devices_file.exists():
+                backup_file = self.devices_file.with_suffix('.json.backup')
+                copy2(self.devices_file, backup_file)
+                logger.debug(f"Created backup: {backup_file}")
+            
+            devices_dict = {name: device.to_dict() for name, device in self.devices.items()}
+            
+            with open(self.devices_file, 'w') as f:
+                json.dump(devices_dict, f, indent=2)
+            logger.debug(f"Saved {len(devices_dict)} devices to {self.devices_file}")
+        except Exception as e:
+            logger.error(f"Failed to save devices: {e}")
+            raise
     
     def add_device(self, device: Device):
         self.devices[device.name] = device
@@ -139,8 +176,16 @@ class CommandExecutor:
     @staticmethod
     async def ping_device(ip: str, timeout: int = 2) -> bool:
         try:
+            # Windows uses different ping flags than Unix
+            if platform.system().lower() == 'windows':
+                # Windows: -n count, -w timeout(milliseconds)
+                cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), ip]
+            else:
+                # Unix/Linux/macOS: -c count, -W timeout(seconds)
+                cmd = ["ping", "-c", "1", "-W", str(timeout), ip]
+            
             process = await asyncio.create_subprocess_exec(
-                "ping", "-c", "1", "-W", str(timeout), ip,
+                *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
@@ -154,7 +199,13 @@ class CommandExecutor:
         ssh_cmd = ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "StrictHostKeyChecking=no"]
         
         if device.ssh_key:
-            ssh_cmd.extend(["-i", device.ssh_key])
+            # Validate SSH key file exists and is readable
+            key_path = Path(device.ssh_key)
+            if not key_path.exists():
+                return False, f"SSH key file not found: {device.ssh_key}"
+            if not key_path.is_file():
+                return False, f"SSH key path is not a file: {device.ssh_key}"
+            ssh_cmd.extend(["-i", str(key_path)])
         
         if device.port != 22:
             ssh_cmd.extend(["-p", str(device.port)])
@@ -170,7 +221,10 @@ class CommandExecutor:
             stdout, stderr = await process.communicate()
             
             success = process.returncode == 0
-            output = stdout.decode() if stdout else stderr.decode()
+            if stdout:
+                output = stdout.decode('utf-8', errors='replace')
+            else:
+                output = stderr.decode('utf-8', errors='replace')
             return success, output.strip()
         except Exception as e:
             return False, str(e)
@@ -181,6 +235,14 @@ class DeviceBot:
         self.executor = CommandExecutor()
         self.user_status_messages: Dict[int, int] = {}
         self.user_menu_messages: Dict[int, int] = {}
+        self.active_tasks: Dict[str, Set[asyncio.Task]] = {}
+        self._task_lock = None
+    
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the task lock."""
+        if self._task_lock is None:
+            self._task_lock = asyncio.Lock()
+        return self._task_lock
         
     def is_authorized(self, user_id: int) -> bool:
         return user_id in self.config.authorized_user_ids
@@ -243,6 +305,36 @@ class DeviceBot:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception:
             pass
+    
+    async def execute_task_with_tracking(self, device_name: str, coro):
+        """Execute a coroutine as a tracked task for a device."""
+        task = asyncio.create_task(coro)
+        async with self._get_lock():
+            if device_name not in self.active_tasks:
+                self.active_tasks[device_name] = set()
+            self.active_tasks[device_name].add(task)
+        
+        try:
+            await task
+        finally:
+            async with self._get_lock():
+                if device_name in self.active_tasks:
+                    self.active_tasks[device_name].discard(task)
+                    if not self.active_tasks[device_name]:
+                        del self.active_tasks[device_name]
+    
+    async def get_active_tasks_info(self, device_name: str) -> str:
+        """Get information about active tasks for a device."""
+        async with self._get_lock():
+            tasks = self.active_tasks.get(device_name, set())
+            count = len(tasks)
+            if count > 0:
+                return f"\n⚠️ {count} task(s) already running on this device"
+            return ""
+    
+    async def _update_message(self, user_id: int, chat_id: int, msg: str, context: ContextTypes.DEFAULT_TYPE):
+        """Helper to update user status message."""
+        await self.update_status_message(user_id, chat_id, msg, context)
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_id = update.effective_user.id
@@ -560,6 +652,29 @@ class DeviceBot:
     async def add_device_ssh_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data['conversation_messages'].append(update.message.message_id)
         ssh_key = update.message.text.strip()
+        
+        # Validate SSH key path if provided
+        if ssh_key:
+            key_path = Path(ssh_key)
+            if not key_path.exists():
+                user_id = update.effective_user.id
+                chat_id = update.message.chat_id
+                await self.update_status_message(
+                    user_id, chat_id, 
+                    f"SSH key file not found: {ssh_key}\nPlease check the path and try again:", 
+                    context
+                )
+                return ADD_SSH_KEY
+            if not key_path.is_file():
+                user_id = update.effective_user.id
+                chat_id = update.message.chat_id
+                await self.update_status_message(
+                    user_id, chat_id, 
+                    f"SSH key path is not a file: {ssh_key}\nPlease provide a valid file path:", 
+                    context
+                )
+                return ADD_SSH_KEY
+        
         context.user_data['new_device_ssh_key'] = ssh_key
         return await self.add_device_confirm(update, context)
     
@@ -759,144 +874,184 @@ class DeviceBot:
             await self.update_status_message(user_id, chat_id, f"Device '{device_name}' not found", context)
             return
         
-        try:
-            if action == 'wake':
-                await self._wake_device(device, user_id, chat_id, context)
-            elif action == 'shutdown':
-                await self._shutdown_device(device, user_id, chat_id, context)
-            elif action == 'restart':
-                await self._restart_device(device, user_id, chat_id, context)
-            elif action == 'sleep':
-                await self._sleep_device(device, user_id, chat_id, context)
-            elif action == 'status':
-                await self._status_device(device, user_id, chat_id, context)
-            else:
-                await self.update_status_message(user_id, chat_id, f"Unknown action: {action}", context)
+        # Show warning if other tasks are running (but allow concurrent execution)
+        active_info = await self.get_active_tasks_info(device_name)
+        if active_info:
+            logger.info(f"Concurrent task detected: {active_info}")
         
-        except Exception as e:
-            error_msg = f"Action Failed\nDevice: {device.name}\nAction: {action}\nError: {str(e)}"
-            await self.update_status_message(user_id, chat_id, error_msg, context)
+        # Create async task wrapper for the action
+        async def action_wrapper():
+            try:
+                if action == 'wake':
+                    await self._wake_device(device, user_id, chat_id, context)
+                elif action == 'shutdown':
+                    await self._shutdown_device(device, user_id, chat_id, context)
+                elif action == 'restart':
+                    await self._restart_device(device, user_id, chat_id, context)
+                elif action == 'sleep':
+                    await self._sleep_device(device, user_id, chat_id, context)
+                elif action == 'status':
+                    await self._status_device(device, user_id, chat_id, context)
+                else:
+                    await self.update_status_message(user_id, chat_id, f"Unknown action: {action}", context)
+            except Exception as e:
+                logger.error(f"Action failed: {action} on {device_name}: {e}", exc_info=True)
+                error_msg = f"❌ Action Failed\nDevice: {device.name}\nAction: {action}\nError: {str(e)}"
+                await self.update_status_message(user_id, chat_id, error_msg, context)
+        
+        # Fire and forget - don't await, let it run in background
+        asyncio.create_task(self.execute_task_with_tracking(device_name, action_wrapper()))
     
     async def _wake_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        send_magic_packet(device.mac)
-        await self.update_status_message(user_id, chat_id, f"Wake-on-LAN sent to {device.name}", context)
+        logger.info(f"Waking device {device.name} ({device.ip})")
         
+        # Run blocking WOL function in executor to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, send_magic_packet, device.mac)
+        logger.debug(f"Wake-on-LAN packet sent to {device.mac}")
+        
+        await self._update_message(user_id, chat_id, f"🔍 {device.name}\n📡 Wake-on-LAN sent...", context)
         await asyncio.sleep(2)
-        await self.update_status_message(user_id, chat_id, f"Wake-on-LAN sent to {device.name}\nWaiting for ping...", context)
+        await self._update_message(user_id, chat_id, f"🔍 {device.name}\n⏳ Waiting for response...", context)
         
-        max_attempts = 12
-        for attempt in range(max_attempts):
+        for attempt in range(BotConfig.WAKE_MAX_ATTEMPTS):
             is_up = await self.executor.ping_device(device.ip)
             if is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is now UP", context)
+                logger.info(f"Device {device.name} is now UP after {attempt + 1} attempts")
+                await self._update_message(user_id, chat_id, f"✅ {device.name}\n🟢 Device is ONLINE", context)
                 return
-            await asyncio.sleep(5)
+            await asyncio.sleep(BotConfig.WAKE_CHECK_INTERVAL)
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} did not start within 60 seconds❌\nCheck manually", context)
+        total_time = BotConfig.WAKE_MAX_ATTEMPTS * BotConfig.WAKE_CHECK_INTERVAL
+        logger.warning(f"Device {device.name} did not start within {total_time} seconds")
+        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Device did not start within {total_time}s\n🔍 Check manually", context)
     
     async def _shutdown_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"Shutting down device {device.name} ({device.ip})")
         shutdown_cmd = "shutdown /s /t 0" if device.os.lower() == 'windows' else "sudo -n /sbin/shutdown -h now"
         
-        await self.update_status_message(user_id, chat_id, f"Sending shutdown command to {device.name}...", context)
+        await self._update_message(user_id, chat_id, f"🛑 {device.name}\n⏳ Sending shutdown command...", context)
         
         success, output = await self.executor.ssh_command(device, shutdown_cmd)
         
         if not success:
-            await self.update_status_message(user_id, chat_id, f"Shutdown failed for {device.name}\nError: {output}", context)
+            logger.error(f"Shutdown failed for {device.name}: {output}")
+            await self._update_message(user_id, chat_id, f"❌ {device.name}\n💥 Shutdown failed\n📝 {output}", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"Shutdown command sent to {device.name}🟡\nWaiting for device to go down...", context)
+        logger.debug(f"Shutdown command sent to {device.name}, waiting for device to go down")
+        await self._update_message(user_id, chat_id, f"🛑 {device.name}\n📡 Command sent, waiting...", context)
         
-        max_attempts = 12
-        for attempt in range(max_attempts):
-            await asyncio.sleep(5)
+        for attempt in range(BotConfig.SHUTDOWN_MAX_ATTEMPTS):
+            await asyncio.sleep(BotConfig.SHUTDOWN_CHECK_INTERVAL)
             is_up = await self.executor.ping_device(device.ip)
             if not is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is now DOWN🛑", context)
+                logger.info(f"Device {device.name} is now DOWN after {attempt + 1} attempts")
+                await self._update_message(user_id, chat_id, f"✅ {device.name}\n🔴 Device is OFFLINE", context)
                 return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} is still UP after 60 seconds🟡\nCheck manually", context)
+        total_time = BotConfig.SHUTDOWN_MAX_ATTEMPTS * BotConfig.SHUTDOWN_CHECK_INTERVAL
+        logger.warning(f"Device {device.name} is still UP after {total_time} seconds")
+        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n🟡 Still running after {total_time}s\n🔍 Check manually", context)
     
     async def _restart_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"Restarting device {device.name} ({device.ip})")
         restart_cmd = "shutdown /r /t 0" if device.os.lower() == 'windows' else "sudo -n reboot now"
         
-        await self.update_status_message(user_id, chat_id, f"Sending restart command to {device.name}...", context)
+        await self._update_message(user_id, chat_id, f"🔄 {device.name}\n⏳ Sending restart command...", context)
         
         success, output = await self.executor.ssh_command(device, restart_cmd)
         
         if not success:
-            await self.update_status_message(user_id, chat_id, f"Restart failed for {device.name}\nError: {output}", context)
+            logger.error(f"Restart failed for {device.name}: {output}")
+            await self._update_message(user_id, chat_id, f"❌ {device.name}\n💥 Restart failed\n📝 {output}", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"Restart command sent to {device.name}\nWaiting for device to go down...", context)
+        logger.debug(f"Restart command sent to {device.name}, waiting for device to go down")
+        await self._update_message(user_id, chat_id, f"🔄 {device.name}\n📡 Command sent, waiting...", context)
         
-        await asyncio.sleep(10)
+        await asyncio.sleep(BotConfig.RESTART_INITIAL_WAIT)
         
         down_detected = False
-        for attempt in range(6):
-            await asyncio.sleep(5)
+        for attempt in range(BotConfig.RESTART_DOWN_CHECK_ATTEMPTS):
+            await asyncio.sleep(BotConfig.RESTART_CHECK_INTERVAL)
             is_up = await self.executor.ping_device(device.ip)
             if not is_up:
                 down_detected = True
+                logger.debug(f"Device {device.name} went down after {attempt + 1} attempts")
                 break
         
         if not down_detected:
-            await self.update_status_message(user_id, chat_id, f"{device.name} did not go down❌\nRestart may have failed", context)
+            logger.warning(f"Device {device.name} did not go down, restart may have failed")
+            await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Did not go down\n🔍 Restart may have failed", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} is down 🟡 \nWaiting for device to come back up...", context)
+        logger.debug(f"Device {device.name} is down, waiting for it to come back up")
+        await self._update_message(user_id, chat_id, f"🔄 {device.name}\n🔴 Device is down\n⏳ Booting up...", context)
         
-        max_attempts = 24
-        for attempt in range(max_attempts):
-            await asyncio.sleep(5)
+        for attempt in range(BotConfig.RESTART_MAX_ATTEMPTS):
+            await asyncio.sleep(BotConfig.RESTART_CHECK_INTERVAL)
             is_up = await self.executor.ping_device(device.ip)
             if is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is UP ✅ after restart", context)
+                logger.info(f"Device {device.name} is UP after restart")
+                await self._update_message(user_id, chat_id, f"✅ {device.name}\n🟢 Restart complete!", context)
                 return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} did not come back up within 120 seconds❌\nCheck manually", context)
+        total_time = BotConfig.RESTART_MAX_ATTEMPTS * BotConfig.RESTART_CHECK_INTERVAL
+        logger.warning(f"Device {device.name} did not come back up within {total_time} seconds")
+        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Did not boot within {total_time}s\n🔍 Check manually", context)
     
     async def _sleep_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         if device.os.lower() != 'windows':
-            await self.update_status_message(user_id, chat_id, f"Sleep command only supported for Windows devices\n{device.name} is running {device.os}", context)
+            logger.warning(f"Sleep command attempted on non-Windows device: {device.name} ({device.os})")
+            await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Windows only\n🖥️ Running: {device.os}", context)
             return
         
+        logger.info(f"Putting device {device.name} ({device.ip}) to sleep")
         sleep_cmd = "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"
         
-        await self.update_status_message(user_id, chat_id, f"Sending sleep command to {device.name}...", context)
+        await self._update_message(user_id, chat_id, f"💤 {device.name}\n⏳ Sending sleep command...", context)
         
         success, output = await self.executor.ssh_command(device, sleep_cmd)
         
         if not success:
-            await self.update_status_message(user_id, chat_id, f"Sleep failed for {device.name}\nError: {output}", context)
+            logger.error(f"Sleep failed for {device.name}: {output}")
+            await self._update_message(user_id, chat_id, f"❌ {device.name}\n💥 Sleep failed\n📝 {output}", context)
             return
         
-        await self.update_status_message(user_id, chat_id, f"Sleep command sent to {device.name}\nWaiting for device to sleep...💤", context)
+        logger.debug(f"Sleep command sent to {device.name}, waiting for device to sleep")
+        await self._update_message(user_id, chat_id, f"💤 {device.name}\n📡 Command sent...", context)
         
-        max_attempts = 12
-        for attempt in range(max_attempts):
-            await asyncio.sleep(5)
+        for attempt in range(BotConfig.SLEEP_MAX_ATTEMPTS):
+            await asyncio.sleep(BotConfig.SLEEP_CHECK_INTERVAL)
             is_up = await self.executor.ping_device(device.ip)
             if not is_up:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is sleeping or down🛑", context)
+                logger.info(f"Device {device.name} is now sleeping or down after {attempt + 1} attempts")
+                await self._update_message(user_id, chat_id, f"✅ {device.name}\n💤 Device is sleeping", context)
                 return
         
-        await self.update_status_message(user_id, chat_id, f"{device.name} is still UP after 60 seconds\nCheck manually", context)
+        total_time = BotConfig.SLEEP_MAX_ATTEMPTS * BotConfig.SLEEP_CHECK_INTERVAL
+        logger.warning(f"Device {device.name} is still UP after {total_time} seconds")
+        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n🟡 Still running after {total_time}s\n🔍 Check manually", context)
     
     async def _status_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        await self.update_status_message(user_id, chat_id, f"Checking {device.name} status...", context)
+        logger.debug(f"Checking status of {device.name} ({device.ip})")
+        await self._update_message(user_id, chat_id, f"📊 {device.name}\n🔍 Checking status...", context)
         
         is_ping_up = await self.executor.ping_device(device.ip)
         
         if is_ping_up:
-            await self.update_status_message(user_id, chat_id, f"{device.name} is UP ✅ (responds to ping)", context)
+            logger.debug(f"Device {device.name} is UP (responds to ping)")
+            await self._update_message(user_id, chat_id, f"📊 {device.name}\n🟢 ONLINE (ping OK)", context)
         else:
             success, output = await self.executor.ssh_command(device, "echo 'SSH test'", timeout=5)
             
             if success:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is UP ✅(SSH accessible, ping blocked)", context)
+                logger.debug(f"Device {device.name} is UP (SSH accessible, ping blocked)")
+                await self._update_message(user_id, chat_id, f"📊 {device.name}\n🟡 ONLINE (SSH OK, ping blocked)", context)
             else:
-                await self.update_status_message(user_id, chat_id, f"{device.name} is DOWN 🛑 \nNo response to ping or SSH", context)
+                logger.debug(f"Device {device.name} is DOWN (no response to ping or SSH)")
+                await self._update_message(user_id, chat_id, f"📊 {device.name}\n🔴 OFFLINE", context)
     
     def create_device_command_handler(self, action: str, device_name: str) -> Callable:
         async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -913,10 +1068,10 @@ class DeviceBot:
     def run(self):
         try:
             self.config.load_config()
-            print(f"Loaded {len(self.config.devices)} devices")
-            print(f"Authorized user IDs: {', '.join(map(str, self.config.authorized_user_ids))}")
+            logger.info(f"Loaded {len(self.config.devices)} devices")
+            logger.info(f"Authorized user IDs: {', '.join(map(str, self.config.authorized_user_ids))}")
         except Exception as e:
-            print(f"Configuration error: {e}")
+            logger.error(f"Configuration error: {e}", exc_info=True)
             sys.exit(1)
         
         app = ApplicationBuilder().token(self.config.token).build()
@@ -964,8 +1119,8 @@ class DeviceBot:
                 handler = self.create_device_command_handler("sleep", device_name)
                 app.add_handler(CommandHandler(command_name, handler))
         
-        print("Starting Telegram Device Management Bot...")
-        print("Bot is ready!")
+        logger.info("Starting Telegram Device Management Bot...")
+        logger.info("Bot is ready!")
         app.run_polling()
 
 def main():
@@ -973,9 +1128,9 @@ def main():
         bot = DeviceBot()
         bot.run()
     except KeyboardInterrupt:
-        print("\nBot stopped by user")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        print(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == '__main__':
