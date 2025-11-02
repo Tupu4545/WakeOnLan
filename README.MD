@@ -326,7 +326,7 @@ This bot provides remote access to power management functions. Use responsibly a
 
 ## 📧 Support
 
-If you encounter any issues or have questions, feel free to dm me on telegram [@tupu4545](t.me/tupu4545) please [open an issue](https://github.com/Tupu4545/WakeOnLan/issues) on GitHub.
+If you encounter any issues or have questions, feel free to dm me on telegram [@tupu4545](https://t.me/tupu4545) please [open an issue](https://github.com/Tupu4545/WakeOnLan/issues) on GitHub.
 
 ---
 
