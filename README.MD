@@ -2,6 +2,8 @@
 
 A powerful bot for remotely managing your devices via Wake-on-LAN, SSH, and power control commands. Control multiple Windows, Linux, and macOS machines from Telegram and Discord with a persistent 3-message UI.
 
+⭐️ **If you find this project useful, please consider starring the repository on GitHub to support its development!**
+
 **View original source and credit:** [https://github.com/Tupu4545/WakeOnLan](https://github.com/Tupu4545/WakeOnLan)
 
 ---
@@ -134,6 +136,16 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now wol-bot.service
+```
+
+### Option 3: Upgrading an Existing Installation
+When new features or fixes are pushed, you can seamlessly update without breaking your configuration:
+```bash
+cd WakeOnLan
+git pull origin main
+source venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart wol-bot
 ```
 
 ---
