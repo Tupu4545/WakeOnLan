@@ -86,13 +86,43 @@ async def main():
     else:
         logger.info(f"Running standalone (Failover disabled)")
 
+    _bot_tasks = []
+
+    async def start_bots():
+        logger.info("Starting bots...")
+        if tg_bot:
+            try:
+                await tg_bot.start_polling()
+            except Exception as e:
+                logger.error(f"Failed to start Telegram bot: {e}")
+        if dc_bot:
+            t = asyncio.create_task(dc_bot.start())
+            _bot_tasks.append(t)
+
+    async def stop_bots():
+        logger.info("Stopping bots...")
+        if tg_bot:
+            try:
+                await tg_bot.stop_polling()
+            except Exception as e:
+                logger.error(f"Failed to stop Telegram bot: {e}")
+        if dc_bot:
+            try:
+                await dc_bot.stop()
+            except Exception as e:
+                logger.error(f"Failed to stop Discord bot: {e}")
+        if _bot_tasks:
+            await asyncio.gather(*_bot_tasks, return_exceptions=True)
+            _bot_tasks.clear()
+
+    if watcher:
+        watcher.on_primary_down = start_bots
+        watcher.on_primary_up = stop_bots
+
     # ── Graceful shutdown ──
     shutdown = GracefulShutdown()
     shutdown.register(monitor.stop)
-    if tg_bot:
-        shutdown.register(tg_bot.stop_polling)
-    if dc_bot:
-        shutdown.register(dc_bot.stop)
+    shutdown.register(stop_bots)
     if heartbeat:
         # Wrap stop in coroutine so GracefulShutdown can await it
         shutdown.register(lambda: asyncio.to_thread(heartbeat.stop))
@@ -120,20 +150,12 @@ async def main():
     # Start failover watcher (backup nodes)
     if watcher:
         await watcher.start()
-
-    # Start bots
-    tasks = []
-    
-    tasks.append(shutdown.wait())
-
-    if tg_bot:
-        await tg_bot.start_polling()
-
-    if dc_bot:
-        tasks.append(dc_bot.start())
+    else:
+        # Standalone or primary node starts bots immediately
+        await start_bots()
 
     try:
-        await asyncio.gather(*tasks)
+        await shutdown.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
