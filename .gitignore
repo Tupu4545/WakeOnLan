@@ -37,10 +37,18 @@ env/
 # Configuration Files (contains sensitive data)
 devices.json
 devices.json.backup
+message_state.json
+LOGIC.md
 
-# Logs
+# Gemini / AI
+.gemini/
+
+# Logs & Output
 *.log
 bot.log
+*.out
+*.pid
+
 
 # IDE
 .vscode/

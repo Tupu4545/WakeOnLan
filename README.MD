@@ -1,70 +1,97 @@
-# Telegram Device Manager Bot
+# WakeOnLan Telegram & Discord Manager
 
-A powerful Telegram bot for remotely managing your devices via Wake-on-LAN, SSH, and power control commands. Control multiple Windows, Linux, and macOS machines from your phone.
+A powerful bot for remotely managing your devices via Wake-on-LAN, SSH, and power control commands. Control multiple Windows, Linux, and macOS machines from Telegram and Discord with a persistent 3-message UI.
+
+**View original source and credit:** [https://github.com/Tupu4545/WakeOnLan](https://github.com/Tupu4545/WakeOnLan)
+
+---
+
+## 📷 Setup Preview
+
+*[setup visual/screenshot placeholder]*
+
+---
 
 ## 🌟 Features
 
-- **Wake-on-LAN** - Remotely wake sleeping devices
-- **Power Management** - Shutdown, restart, and sleep commands
-- **Device Status** - Check if devices are online via ping/SSH
-- **Multi-Device Support** - Manage unlimited devices
-- **Interactive Menu** - Clean button-based interface
-- **Device Management** - Add/remove devices directly from Telegram
-- **Persistent UI** - Menu stays visible, status updates dynamically
-- **Auto-Monitoring** - Ping loops verify device state changes
-- **User Authentication** - Restrict access via Telegram User IDs
+- **Wake-on-LAN** — Remotely wake sleeping devices
+- **Power Management** — Shutdown, restart, and sleep commands
+- **Device Status** — Check if devices are online via ping/SSH with 5-second automatic fallback timeout
+- **Live Stats Dashboard** — Auto-refreshing status of all devices, bot uptime, and failover health
+- **3-Message Persistent UI** — Control panel, stats dashboard, and action log that survive restarts
+- **Multi-Device Support** — Manage unlimited devices
+- **Dual Platform** — Works on both Telegram and Discord natively
+- **Discord DM Support** — Control interface injected directly into authorized users' DMs
+- **Active-Passive Failover** — Automatic takeover if the primary node goes down
+- **Background Monitoring** — Periodic device status checks with online/offline history every 30 seconds
+- **User Authentication** — Restrict access via Telegram User IDs or Discord User IDs
+- **Lightweight** — Highly optimized hardware efficiency to run on a Raspberry Pi
+
+---
+
+## 🌐 Network Notice
+
+**Important:** This bot must reside within the **same local broadcast domain (LAN)** as the target devices (or be bridged via a VPN) for the Wake-on-LAN (WoL) UDP magic packets to successfully wake devices. 
+
+Other functions such as SSH shutdown, reboot, and ping checks work flawlessly over any standard routed network regardless of the broadcast domain, provided the ports are accessible.
+
+---
 
 ## 📋 Prerequisites
 
-- Python 3.8 or higher
-- A Telegram Bot Token (from [@BotFather](https://t.me/botfather))
+- A Telegram Bot Token (from [@BotFather](https://t.me/botfather)) and/or a Discord Bot Token (from the [Discord Developer Portal](https://discord.com/developers/applications))
 - Devices must support:
   - Wake-on-LAN (for wake functionality)
-  - SSH access (for shutdown/restart/status)
-  - Proper network configuration
+  - SSH access (for shutdown/restart/status reporting over standard routed networks)
+
+---
 
 ## 🚀 Installation
 
-### 1. Clone the Repository
+You can install the bot automatically via our setup script or manually line-by-line.
+
+### Option 1: Automatic Installation (Recommended)
+
+Run the following command cleanly to deploy the virtual environment, install dependencies, map your `.env` tokens, and establish a permanent background `systemctl` daemon service automatically.
+
+> **Note:** The script will request `sudo` permissions to install OS-level dependencies (`python3`, `git`) and write the systemd unit file. Please review the [install script source](https://github.com/Tupu4545/WakeOnLan/blob/main/install.sh) before executing it on your machine.
 
 ```bash
-git clone https://github.com/yourusername/telegram-device-manager.git
-cd telegram-device-manager
+bash <(curl -s https://raw.githubusercontent.com/Tupu4545/WakeOnLan/main/install.sh)
 ```
 
-### 2. Create Virtual Environment
+### Option 2: Manual Installation
 
+If you prefer to configure everything manually, follow the steps below:
+
+#### 1. Clone the Repository
+```bash
+git clone https://github.com/Tupu4545/WakeOnLan.git
+cd WakeOnLan
+```
+
+#### 2. Create Virtual Environment
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate
 ```
 
-### 3. Install Dependencies
-
+#### 3. Install Dependencies
 ```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
-
-Create a `.env` file in the project root:
-
-```properties
-TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
-AUTHORIZED_USER_IDS=123456789,987654321
+#### 4. Configure Environment Variables
+Copy the example file and modify it with your credentials:
+```bash
+cp example.env .env
+nano .env
 ```
+*(Leave Telegram or Discord tokens blank if you only wish to deploy one platform.)*
 
-**How to get your User ID:**
-
-1. Start the bot without adding your ID
-2. Send `/start` to the bot
-3. The bot will show your User ID in the error message
-4. Add your User ID to `.env` and restart the bot
-
-### 5. Configure Devices
-
-Create a `devices.json` file (or use the bot's add device feature):
-
+#### 5. Configure Devices Inventory
+Create a `devices.json` file to house your machines locally.
 ```json
 {
   "Windows-PC": {
@@ -74,262 +101,73 @@ Create a `devices.json` file (or use the bot's add device feature):
     "user": "Administrator",
     "port": 22,
     "ssh_key": null
-  },
-  "Ubuntu-Server": {
-    "ip": "192.168.1.200",
-    "mac": "11:22:33:44:55:66",
-    "os": "linux",
-    "user": "admin",
-    "port": 22,
-    "ssh_key": "/home/user/.ssh/id_rsa"
   }
 }
 ```
 
-### 6. Run the Bot
+#### 6. (Optional) Run as a systemd Service
+To ensure 24/7 uptime through device restarts, create a systemd service:
 
 ```bash
-python bot.py
+sudo nano /etc/systemd/system/wol-bot.service
 ```
 
-## ⚙️ Running 24/7 as a Service
+```ini
+[Unit]
+Description=WakeOnLan Discord/Telegram Bot
+After=network-online.target
+Wants=network-online.target
 
-To keep your bot running continuously, you can set it up as a `systemd` service on Linux or a Task Scheduler job on Windows.
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/path/to/WakeOnLan
+ExecStart=/path/to/WakeOnLan/venv/bin/python /path/to/WakeOnLan/main.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/path/to/WakeOnLan/.env
 
-### 🐧 Linux (Recommended)
-
-1. **Create a `systemd` service file**
-
-    Create and open a service file:
-
-    ```sh
-    sudo nano /etc/systemd/system/telegram-bot.service
-    ```
-
-    Paste this configuration:
-
-    ```ini
-    [Unit]
-    Description=Telegram Device Manager Bot
-    After=network.target
-
-    [Service]
-    Type=simple
-    WorkingDirectory=/home/yourusername/telegram-device-manager
-    ExecStart=/home/yourusername/telegram-device-manager/venv/bin/python /home/yourusername/telegram-device-manager/bot.py
-    Restart=always
-    RestartSec=10
-    User=yourusername
-    Environment=PYTHONUNBUFFERED=1
-
-    [Install]
-    WantedBy=multi-user.target
-    ```
-
-    > ⚠️ **Important:** Replace `/home/yourusername/telegram-device-manager` with your actual project path and `yourusername` with your username.
-
-2. **Enable and start the service**
-
-    ```sh
-    sudo systemctl daemon-reload
-    sudo systemctl enable telegram-bot.service
-    sudo systemctl start telegram-bot.service
-    ```
-
-3. **Check logs and status**
-
-    ```sh
-    sudo systemctl status telegram-bot.service
-    sudo journalctl -u telegram-bot.service -f
-    ```
-
-The bot will now auto-start on boot and restart automatically if it crashes.
-
----
-
-### 🪟 Windows (Optional)
-
-If you’re running this on Windows, use Task Scheduler to keep it alive.
-
-1. **Create a `.bat` file**
-    Inside your project folder, create a file called `start_bot.bat`:
-
-    ```bat
-    @echo off
-    cd /d "C:\Path\To\telegram-device-manager"
-    call venv\Scripts\activate
-    python bot.py
-    ```
-
-    > ⚠️ **Note:** Replace `C:\Path\To\telegram-device-manager` with your actual project path.
-
-2. **Schedule it**
-    - Open **Task Scheduler**
-    - Click **Create Task**
-    - Under **General** tab:
-        - Name: `TelegramBot`
-        - Check **Run whether user is logged on or not**
-    - Go to **Triggers** → **New** → Begin the task: **At startup**
-    - Go to **Actions** → **New** → Program/script:
-        - `C:\Path\To\telegram-device-manager\start_bot.bat`
-    - Click OK, then right-click the task and **Run** to test it.
-
-> 💡 **Tip:** To restart automatically if it stops, you can also use “Repeat task every 5 minutes for a duration of indefinitely” under the **Triggers** tab.
-
----
-
-## 🔧 Configuration
-
-### Device Configuration Fields
-
-| Field | Required | Description | Example |
-|-------|----------|-------------|---------|
-| `ip` | Yes | Device IP address | `192.168.1.100` |
-| `mac` | Yes | MAC address for WOL | `AA:BB:CC:DD:EE:FF` |
-| `os` | Yes | Operating system | `windows`, `linux`, `macos` |
-| `user` | Yes | SSH username | `admin` |
-| `port` | No | SSH port (default: 22) | `22` |
-| `ssh_key` | No | Path to SSH private key | `/home/user/.ssh/id_rsa` |
-
-### SSH Setup
-
-For shutdown/restart commands to work, configure passwordless SSH:
-
-**Linux/macOS:**
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-# Generate SSH key (if you don't have one)
+sudo systemctl daemon-reload
+sudo systemctl enable --now wol-bot.service
+```
+
+---
+
+## 🔧 SSH Setup
+
+For shutdown/restart commands, configure passwordless SSH:
+
+```bash
+# Generate SSH key
 ssh-keygen -t rsa -b 4096
 
-# Copy key to remote device
+# Copy to remote device
 ssh-copy-id user@device-ip
 
-# Configure sudoers for passwordless shutdown
+# Allow passwordless shutdown/reboot/suspend on the remote device
 sudo visudo
-# Add: yourusername ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/reboot
+# Add: yourusername ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/reboot, /usr/bin/systemctl suspend
 ```
-
-**Windows:**
-
-1. Install OpenSSH Server
-2. Configure SSH key authentication
-3. Ensure user has shutdown privileges
-
-## 📱 Usage
-
-### Basic Commands
-
-- `/start` - Initialize the bot (first time only)
-- `/menu` - Show device control panel
-- `/help` - List all available commands
-- `/list` - Show all configured devices
-- `/add_device` - Add a new device interactively
-- `/remove_device` - Remove a device
-
-### Device Commands
-
-For each device, you can use:
-
-- `/wake_devicename` - Wake device via WOL
-- `/shutdown_devicename` - Shutdown device
-- `/restart_devicename` - Restart device
-- `/status_devicename` - Check device status
-- `/sleep_devicename` - Sleep device (Windows only)
-
-### Interactive Menu
-
-The bot provides an interactive menu with buttons:
-
-```
-[➕] [➖] [📋]
-━━━━━━━━━━━━
-Windows-PC
-[🟢] [🛑] [🔄] [📊] [💤]
-Ubuntu-Server
-[🟢] [🛑] [🔄] [📊]
-```
-
-- ➕ - Add new device
-- ➖ - Remove device
-- 📋 - List all devices
-- 🟢 - Wake device
-- 🛑 - Shutdown device
-- 🔄 - Restart device
-- 📊 - Check status
-- 💤 - Sleep (Windows only)
-
-## 🔒 Security
-
-- **User Authentication**: Only authorized Telegram User IDs can use the bot
-- **SSH Keys**: Recommended for secure authentication
-- **Environment Variables**: Sensitive data stored in `.env` (not committed to git)
-- **Sudo Configuration**: Limit passwordless sudo to specific commands only
-
-## 🛠️ Troubleshooting
-
-### Bot doesn't respond
-
-- Check if bot token is correct in `.env`
-- Verify your User ID is in `AUTHORIZED_USER_IDS`
-- Ensure bot is running without errors
-
-### Wake-on-LAN not working
-
-- Verify MAC address is correct
-- Enable WOL in device BIOS/UEFI
-- Check if device supports WOL
-- Ensure device is on the same network
-
-### SSH commands fail
-
-- Test SSH connection manually: `ssh user@device-ip`
-- Verify SSH key permissions (600 for private key)
-- Check sudoers configuration for passwordless commands
-- Ensure SSH service is running on target device
-
-### Device doesn't wake up in time
-
-- Adjust timeout in code (default: 60 seconds)
-- Some devices take longer to boot
-- Check network latency
-
-## 📦 Dependencies
-
-```
-python-telegram-bot>=20.0
-wakeonlan>=3.0.0
-python-dotenv>=1.0.0
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](https://github.com/Tupu4545/WakeOnLan/blob/main/LICENSE) file for details.
-
-## ⚠️ Disclaimer
-
-This bot provides remote access to power management functions. Use responsibly and ensure proper security measures are in place. The authors are not responsible for any misuse or damage caused by this software.
-
-## 🙏 Acknowledgments
-
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) - Telegram Bot API wrapper
-- [wakeonlan](https://github.com/remcohaszing/pywakeonlan) - Wake-on-LAN implementation
-
-## 📧 Support
-
-If you encounter any issues or have questions, feel free to dm me on telegram [@tupu4545](https://t.me/tupu4545) please [open an issue](https://github.com/Tupu4545/WakeOnLan/issues) on GitHub.
 
 ---
 
-Made with ❤️ for remote device management
+## 💡 Optimization & Troubleshooting Tips
 
----
+These are generalized tips derived from real-world deployments on constrained hardware (like Raspberry Pi Zeros):
+
+### 1. Low-Memory Devices (< 512MB RAM)
+Running both the Telegram and Discord clients concurrently alongside background parallel-ping monitors can edge out limited memory resources, especially if running other services simultaneously like Pi-hole or AdGuard.
+* **Tip:** If the bot regularly crashes due to Out of Memory (OOM) kills, gracefully disable the Discord side by simply clearing out `DISCORD_BOT_TOKEN=` inside your `.env`. It will inherently fallback to running exclusively as an ultra-lightweight Telegram bot without breaking core functionality.
+
+### 2. "Split-Brain" Failover Issues
+If you configure an active-passive failover arrangement and suddenly start receiving completely duplicate module messages in your chat UI:
+* **Tip:** Check your local firewall software (`ufw` or `iptables`) on the **Primary Node** and ensure it allows incoming TCP traffic across your designated `HEARTBEAT_PORT` (default `12345`). If the Backup Node cannot successfully reach this port periodically, it assumes the primary is natively dead and mistakenly spins up its own twin bot instance over it.
+
+### 3. VPNs (Tailscale / WireGuard) limitations
+Because the bot supports executing commands via standard SSH tunnels, pinging and power management commands will work universally regardless of how your network traverses virtual subnets or VPNs like Tailscale.
+* **Tip:** However, **Wake-on-LAN (WoL)** relies exclusively on Layer-2 network broadcast UDP packets. These packets are natively dropped across routed VPN tunnels or VLAN boundaries! You must place the bot hardware inside the exact same local subnet as the target device to wake it, *unless* you configure advanced subnet broadcast-relay routing. Stick to providing local intranet IP topologies into your `devices.json`!

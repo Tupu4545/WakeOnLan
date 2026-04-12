@@ -1,1137 +1,809 @@
-import os
-import json
-import asyncio
+"""
+Telegram Bot — 3-message persistent UI for Wake-on-LAN device management.
+
+Messages (top → bottom):
+  1. Control Panel    — inline keyboard with device buttons
+  2. Stats Dashboard  — auto-refreshes, shows device/bot/failover status
+  3. Action Log       — updates in-place when buttons are pressed (bottom)
+"""
+
 import re
-import sys
-import platform
-import logging
-from typing import Dict, List, Optional, Tuple, Callable, Set
-from pathlib import Path
+import asyncio
 import ipaddress
-from dataclasses import dataclass
-from shutil import copy2
+import logging
+from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, 
+    ApplicationBuilder, CommandHandler, ContextTypes,
     CallbackQueryHandler, ConversationHandler, MessageHandler, filters
 )
-from wakeonlan import send_magic_packet
-from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log')
-    ]
-)
+from core.devices import Device, ConfigManager
+from core.executor import CommandExecutor
+from core.state import StateManager, format_time, format_duration, utcnow
+
 logger = logging.getLogger(__name__)
 
-ADD_NAME, ADD_IP, ADD_MAC, ADD_OS, ADD_USER, ADD_PORT, ADD_SSH_KEY = range(7)
+# Conversation states for add-device flow
+ADD_NAME, ADD_IP, ADD_OS, ADD_WOL, ADD_MAC, ADD_SSH, ADD_USER = range(7)
 
-# Configuration constants
-class BotConfig:
-    """Bot configuration constants"""
-    WAKE_MAX_ATTEMPTS = 12
-    WAKE_CHECK_INTERVAL = 5
-    SHUTDOWN_MAX_ATTEMPTS = 12
-    SHUTDOWN_CHECK_INTERVAL = 5
-    RESTART_MAX_ATTEMPTS = 24
-    RESTART_CHECK_INTERVAL = 5
-    RESTART_DOWN_CHECK_ATTEMPTS = 6
-    RESTART_INITIAL_WAIT = 10
-    SLEEP_MAX_ATTEMPTS = 12
-    SLEEP_CHECK_INTERVAL = 5
 
-@dataclass
-class Device:
-    name: str
-    ip: str
-    mac: str
-    os: str
-    user: str
-    ssh_key: Optional[str] = None
-    port: int = 22
-    
-    def __post_init__(self):
-        self._validate_ip()
-        self._validate_mac()
-        self._validate_os()
-    
-    def _validate_ip(self):
-        try:
-            ipaddress.ip_address(self.ip)
-        except ValueError:
-            raise ValueError(f"Invalid IP address: {self.ip}")
-    
-    def _validate_mac(self):
-        mac_pattern = r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$'
-        if not re.match(mac_pattern, self.mac):
-            raise ValueError(f"Invalid MAC address: {self.mac}")
-    
-    def _validate_os(self):
-        valid_os = ['windows', 'linux', 'macos']
-        if self.os.lower() not in valid_os:
-            raise ValueError(f"Invalid OS type: {self.os}. Must be one of {valid_os}")
-    
-    def to_dict(self):
-        return {
-            'ip': self.ip,
-            'mac': self.mac,
-            'os': self.os,
-            'user': self.user,
-            'ssh_key': self.ssh_key,
-            'port': self.port
-        }
+class TelegramBot:
+    """Telegram bot with 3-message persistent UI."""
 
-class ConfigManager:
-    def __init__(self, devices_file: str = "devices.json"):
-        self.devices_file = Path(devices_file)
-        self.devices: Dict[str, Device] = {}
-        self.authorized_user_ids: List[int] = []
-        self.token: str = ""
-        
-    def load_config(self):
-        self._load_env()
-        self._load_devices()
-    
-    def _load_env(self):
-        load_dotenv()
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
-        if not self.token:
-            raise ValueError("TELEGRAM_BOT_TOKEN not set in .env file")
-        
-        users_env = os.getenv("AUTHORIZED_USER_IDS", "")
-        if users_env:
-            try:
-                self.authorized_user_ids = [int(uid.strip()) for uid in users_env.split(",")]
-            except ValueError:
-                raise ValueError("AUTHORIZED_USER_IDS must contain valid integer user IDs separated by commas")
-        else:
-            raise ValueError("AUTHORIZED_USER_IDS not set in .env file")
-        
-        logger.info(f"Loaded configuration: {len(self.authorized_user_ids)} authorized users")
-        
-    def _load_devices(self):
-        if not self.devices_file.exists():
-            with open(self.devices_file, "w") as f:
-                json.dump({}, f, indent=2)
-            logger.info("Created new devices.json file")
-            return
-        
-        try:
-            with open(self.devices_file, "r") as f:
-                devices_data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in {self.devices_file}: {str(e)}")
-        
-        for name, config in devices_data.items():
-            try:
-                device = Device(
-                    name=name,
-                    ip=config['ip'],
-                    mac=config['mac'],
-                    os=config['os'],
-                    user=config['user'],
-                    ssh_key=config.get('ssh_key'),
-                    port=config.get('port', 22)
-                )
-                self.devices[name] = device
-                logger.debug(f"Loaded device: {name} ({device.ip})")
-            except (KeyError, ValueError) as e:
-                logger.warning(f"Invalid device configuration for {name}: {e}")
-                continue
-    
-    def save_devices(self, backup: bool = True):
-        try:
-            if backup and self.devices_file.exists():
-                backup_file = self.devices_file.with_suffix('.json.backup')
-                copy2(self.devices_file, backup_file)
-                logger.debug(f"Created backup: {backup_file}")
-            
-            devices_dict = {name: device.to_dict() for name, device in self.devices.items()}
-            
-            with open(self.devices_file, 'w') as f:
-                json.dump(devices_dict, f, indent=2)
-            logger.debug(f"Saved {len(devices_dict)} devices to {self.devices_file}")
-        except Exception as e:
-            logger.error(f"Failed to save devices: {e}")
-            raise
-    
-    def add_device(self, device: Device):
-        self.devices[device.name] = device
-        self.save_devices()
-    
-    def remove_device(self, device_name: str) -> bool:
-        if device_name in self.devices:
-            del self.devices[device_name]
-            self.save_devices()
-            return True
-        return False
+    def __init__(self, config: ConfigManager, executor: CommandExecutor,
+                 state: StateManager):
+        self.config = config
+        self.executor = executor
+        self.state = state
+        self.app = None
 
-class CommandExecutor:
-    @staticmethod
-    async def ping_device(ip: str, timeout: int = 2) -> bool:
-        try:
-            # Windows uses different ping flags than Unix
-            if platform.system().lower() == 'windows':
-                # Windows: -n count, -w timeout(milliseconds)
-                cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), ip]
-            else:
-                # Unix/Linux/macOS: -c count, -W timeout(seconds)
-                cmd = ["ping", "-c", "1", "-W", str(timeout), ip]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            return_code = await process.wait()
-            return return_code == 0
-        except Exception:
-            return False
-    
-    @staticmethod
-    async def ssh_command(device: Device, command: str, timeout: int = 10) -> Tuple[bool, str]:
-        ssh_cmd = ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "StrictHostKeyChecking=no"]
-        
-        if device.ssh_key:
-            # Validate SSH key file exists and is readable
-            key_path = Path(device.ssh_key)
-            if not key_path.exists():
-                return False, f"SSH key file not found: {device.ssh_key}"
-            if not key_path.is_file():
-                return False, f"SSH key path is not a file: {device.ssh_key}"
-            ssh_cmd.extend(["-i", str(key_path)])
-        
-        if device.port != 22:
-            ssh_cmd.extend(["-p", str(device.port)])
-        
-        ssh_cmd.extend([f"{device.user}@{device.ip}", command])
-        
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *ssh_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            success = process.returncode == 0
-            if stdout:
-                output = stdout.decode('utf-8', errors='replace')
-            else:
-                output = stderr.decode('utf-8', errors='replace')
-            return success, output.strip()
-        except Exception as e:
-            return False, str(e)
+    # ─── Message Builders ───────────────────────────────────────
 
-class DeviceBot:
-    def __init__(self):
-        self.config = ConfigManager()
-        self.executor = CommandExecutor()
-        self.user_status_messages: Dict[int, int] = {}
-        self.user_menu_messages: Dict[int, int] = {}
-        self.active_tasks: Dict[str, Set[asyncio.Task]] = {}
-        self._task_lock = None
-    
-    def _get_lock(self) -> asyncio.Lock:
-        """Get or create the task lock."""
-        if self._task_lock is None:
-            self._task_lock = asyncio.Lock()
-        return self._task_lock
-        
-    def is_authorized(self, user_id: int) -> bool:
-        return user_id in self.config.authorized_user_ids
-    
-    @staticmethod
-    def format_device_key(key: str) -> str:
-        slug = re.sub(r'[^a-zA-Z0-9_]', '_', key.lower())
-        return re.sub(r'_+', '_', slug).strip('_')
-    
-    def generate_help_message(self) -> str:
-        lines = ["Available Commands:\n"]
-        lines.append("Device Management:")
-        lines.append("• /menu - Interactive device control panel")
-        lines.append("• /list - List all devices")
-        lines.append("• /add_device - Add a new device")
-        lines.append("• /remove_device - Remove a device\n")
-        
+    def build_stats_text(self) -> str:
+        """Build a compact stats dashboard — just devices + status emoji."""
+        from core.state import IST
+        now_ist = utcnow().astimezone(IST)
+        time_str = now_ist.strftime("%H:%M:%S IST")
+
+        lines = [f"📊 Devices  ·  {time_str}", "━━━━━━━━━━━━━━━━━━━━━"]
+
         if self.config.devices:
-            lines.append("Device Commands:")
-            for device_name, device in self.config.devices.items():
-                slug = self.format_device_key(device_name)
-                lines.append(f"\n{device_name} ({device.os}):")
-                lines.append(f"• /wake_{slug} - Wake device")
-                lines.append(f"• /shutdown_{slug} - Shutdown device")
-                lines.append(f"• /restart_{slug} - Restart device")
-                lines.append(f"• /status_{slug} - Check device status")
-                
-                if device.os.lower() == 'windows':
-                    lines.append(f"• /sleep_{slug} - Put device to sleep")
-        
+            for name in self.config.devices:
+                stats = self.state.get_device_stats(name)
+                if stats and stats.get("online"):
+                    icon = "🟢"
+                elif stats and stats.get("last_checked"):
+                    icon = "🔴"
+                else:
+                    icon = "⚪"
+                lines.append(f"{icon} {name}")
+        else:
+            lines.append("No devices configured")
+
         return "\n".join(lines)
-    
-    async def send_unauthorized(self, update: Update) -> None:
-        message = f"Access Denied\nYou are not authorized to use this bot.\n\nYour User ID: {update.effective_user.id}"
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(message)
-        elif update.callback_query:
-            await update.callback_query.message.reply_text(message)
-    
-    async def ensure_status_message(self, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
-        if user_id not in self.user_status_messages:
-            status_msg = await context.bot.send_message(chat_id=chat_id, text="Ready")
-            self.user_status_messages[user_id] = status_msg.message_id
-        return self.user_status_messages[user_id]
-    
-    async def update_status_message(self, user_id: int, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE, reply_markup=None):
-        message_id = await self.ensure_status_message(user_id, chat_id, context)
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, 
-                message_id=message_id, 
-                text=text,
-                reply_markup=reply_markup
-            )
-        except Exception:
-            pass
-    
-    async def delete_message_safe(self, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception:
-            pass
-    
-    async def execute_task_with_tracking(self, device_name: str, coro):
-        """Execute a coroutine as a tracked task for a device."""
-        task = asyncio.create_task(coro)
-        async with self._get_lock():
-            if device_name not in self.active_tasks:
-                self.active_tasks[device_name] = set()
-            self.active_tasks[device_name].add(task)
-        
-        try:
-            await task
-        finally:
-            async with self._get_lock():
-                if device_name in self.active_tasks:
-                    self.active_tasks[device_name].discard(task)
-                    if not self.active_tasks[device_name]:
-                        del self.active_tasks[device_name]
-    
-    async def get_active_tasks_info(self, device_name: str) -> str:
-        """Get information about active tasks for a device."""
-        async with self._get_lock():
-            tasks = self.active_tasks.get(device_name, set())
-            count = len(tasks)
-            if count > 0:
-                return f"\n⚠️ {count} task(s) already running on this device"
-            return ""
-    
-    async def _update_message(self, user_id: int, chat_id: int, msg: str, context: ContextTypes.DEFAULT_TYPE):
-        """Helper to update user status message."""
-        await self.update_status_message(user_id, chat_id, msg, context)
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        if not self.is_authorized(user_id):
-            return await self.send_unauthorized(update)
-        
-        welcome_msg = await update.message.reply_text(
-            f"Device Management Bot\n\nWelcome, {update.effective_user.first_name}!\n\nUse /menu for controls or /help for command list."
-        )
-        
-        await self.menu_command(update, context)
-        
-        await asyncio.sleep(3)
-        await self.delete_message_safe(update.message.chat_id, welcome_msg.message_id, context)
-        await self.delete_message_safe(update.message.chat_id, update.message.message_id, context)
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        if not self.is_authorized(user_id):
-            return await self.send_unauthorized(update)
-        
-        help_text = self.generate_help_message()
-        await self.update_status_message(user_id, update.message.chat_id, help_text, context)
-        await self.delete_message_safe(update.message.chat_id, update.message.message_id, context)
-    
-    async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        if not self.is_authorized(user_id):
-            return await self.send_unauthorized(update)
-        
-        if not self.config.devices:
-            await self.update_status_message(user_id, update.message.chat_id, "No devices configured\n\nUse the Add Device button to add your first device!", context)
-            await self.delete_message_safe(update.message.chat_id, update.message.message_id, context)
-            return
-        
-        message = "Configured Devices:\n\n"
-        for name, device in self.config.devices.items():
-            message += f"{name}\n"
-            message += f"• IP: {device.ip}\n"
-            message += f"• MAC: {device.mac}\n"
-            message += f"• OS: {device.os}\n"
-            message += f"• User: {device.user}\n"
-            message += f"• Port: {device.port}\n"
-            if device.ssh_key:
-                message += f"• SSH Key: {device.ssh_key}\n"
-            message += "\n"
-        
-        await self.update_status_message(user_id, update.message.chat_id, message, context)
-        await self.delete_message_safe(update.message.chat_id, update.message.message_id, context)
-    
-    def create_menu_keyboard(self):
-        keyboard = []
-        
-        keyboard.append([
-            InlineKeyboardButton("➕", callback_data="add_device"),
-            InlineKeyboardButton("➖", callback_data="remove_device_menu"),
-            InlineKeyboardButton("📋", callback_data="list_devices")
-        ])
-        
-        if self.config.devices:
-            keyboard.append([InlineKeyboardButton("━━━━━━━━━━━━", callback_data="none")])
-        
-        for device_name, device in self.config.devices.items():
-            row = [
-                InlineKeyboardButton("🟢", callback_data=f"wake:{device_name}"),
-                InlineKeyboardButton("🛑", callback_data=f"shutdown:{device_name}"),
-                InlineKeyboardButton("🔄", callback_data=f"restart:{device_name}"),
-                InlineKeyboardButton("📊", callback_data=f"status:{device_name}")
-            ]
-            
-            if device.os.lower() == 'windows':
-                row.append(InlineKeyboardButton("💤", callback_data=f"sleep:{device_name}"))
-            
-            keyboard.append([InlineKeyboardButton(f"{device_name}", callback_data="none")])
-            keyboard.append(row)
-        
-        return InlineKeyboardMarkup(keyboard)
-    
-    async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        if not self.is_authorized(user_id):
-            return await self.send_unauthorized(update)
-        
-        if not self.config.devices:
-            message = "Device Control Panel\n\nNo devices configured yet.\nUse the buttons below to add devices."
-        else:
-            message = "Device Control Panel\nSelect an action:"
-        
-        reply_markup = self.create_menu_keyboard()
-        
-        if user_id in self.user_menu_messages:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=update.message.chat_id,
-                    message_id=self.user_menu_messages[user_id],
-                    text=message,
-                    reply_markup=reply_markup
-                )
-            except Exception:
-                menu_msg = await update.message.reply_text(message, reply_markup=reply_markup)
-                self.user_menu_messages[user_id] = menu_msg.message_id
-        else:
-            menu_msg = await update.message.reply_text(message, reply_markup=reply_markup)
-            self.user_menu_messages[user_id] = menu_msg.message_id
-        
-        await self.ensure_status_message(user_id, update.message.chat_id, context)
-        
-        if update.message:
-            await self.delete_message_safe(update.message.chat_id, update.message.message_id, context)
-    
-    async def refresh_menu(self, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        if not self.config.devices:
-            message = "Device Control Panel\n\nNo devices configured yet.\nUse the buttons below to add devices."
-        else:
-            message = "Device Control Panel\nSelect an action:"
-        
-        reply_markup = self.create_menu_keyboard()
-        
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=self.user_menu_messages[user_id],
-                text=message,
-                reply_markup=reply_markup
-            )
-        except Exception:
-            pass
-    
-    async def add_device_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        query = update.callback_query
-        
-        if query:
-            await query.answer()
-            user_id = query.from_user.id
-            chat_id = query.message.chat_id
-            if not self.is_authorized(user_id):
-                await self.update_status_message(user_id, chat_id, "Access Denied", context)
-                return ConversationHandler.END
-            
-            context.user_data['conversation_messages'] = []
-            
-            await self.update_status_message(
-                user_id, 
-                chat_id,
-                "Add New Device\n\nStep 1/7: Enter device name\n(e.g., My-Laptop, Office-PC)\n\nSend /cancel to abort.",
-                context
-            )
-        else:
-            user_id = update.effective_user.id
-            chat_id = update.message.chat_id
-            if not self.is_authorized(user_id):
-                return await self.send_unauthorized(update)
-            
-            context.user_data['conversation_messages'] = [update.message.message_id]
-            
-            await self.update_status_message(
-                user_id,
-                chat_id,
-                "Add New Device\n\nStep 1/7: Enter device name\n(e.g., My-Laptop, Office-PC)\n\nSend /cancel to abort.",
-                context
-            )
-        
-        return ADD_NAME
-    
-    async def add_device_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        
-        device_name = update.message.text.strip()
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        if not device_name or len(device_name) < 2:
-            await self.update_status_message(user_id, chat_id, "Device name must be at least 2 characters long. Try again:", context)
-            return ADD_NAME
-        
-        if device_name in self.config.devices:
-            await self.update_status_message(user_id, chat_id, f"Device '{device_name}' already exists. Choose a different name:", context)
-            return ADD_NAME
-        
-        context.user_data['new_device_name'] = device_name
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            f"Device name: {device_name}\n\nStep 2/7: Enter IP address\n(e.g., 192.168.1.100)",
-            context
-        )
-        return ADD_IP
-    
-    async def add_device_ip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        
-        ip_address = update.message.text.strip()
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        try:
-            ipaddress.ip_address(ip_address)
-        except ValueError:
-            await self.update_status_message(user_id, chat_id, "Invalid IP address. Try again:", context)
-            return ADD_IP
-        
-        context.user_data['new_device_ip'] = ip_address
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            f"IP: {ip_address}\n\nStep 3/7: Enter MAC address\n(e.g., AA:BB:CC:DD:EE:FF)",
-            context
-        )
-        return ADD_MAC
-    
-    async def add_device_mac(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        
-        mac_address = update.message.text.strip().upper()
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        mac_pattern = r'^([0-9A-F]{2}[:-]){5}([0-9A-F]{2})$'
-        if not re.match(mac_pattern, mac_address):
-            await self.update_status_message(user_id, chat_id, "Invalid MAC address. Try again:", context)
-            return ADD_MAC
-        
-        context.user_data['new_device_mac'] = mac_address
-        
-        keyboard = [
-            [InlineKeyboardButton("Windows", callback_data="os:windows")],
-            [InlineKeyboardButton("Linux", callback_data="os:linux")],
-            [InlineKeyboardButton("macOS", callback_data="os:macos")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            f"MAC: {mac_address}\n\nStep 4/7: Select OS:",
-            context,
-            reply_markup=reply_markup
-        )
-        return ADD_OS
-    
-    async def add_device_os(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        query = update.callback_query
-        await query.answer()
-        
-        os_type = query.data.split(":")[1]
-        context.user_data['new_device_os'] = os_type
-        
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            f"OS: {os_type}\n\nStep 5/7: Enter SSH username\n(e.g., admin, root)",
-            context
-        )
-        return ADD_USER
-    
-    async def add_device_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        
-        username = update.message.text.strip()
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        if not username:
-            await self.update_status_message(user_id, chat_id, "Username cannot be empty. Try again:", context)
-            return ADD_USER
-        
-        context.user_data['new_device_user'] = username
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            f"User: {username}\n\nStep 6/7: Enter SSH port\n(Send /skip for default 22)",
-            context
-        )
-        return ADD_PORT
-    
-    async def add_device_port(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        
-        port_text = update.message.text.strip()
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        try:
-            port = int(port_text)
-            if port < 1 or port > 65535:
-                raise ValueError
-        except ValueError:
-            await self.update_status_message(user_id, chat_id, "Invalid port. Try again or /skip:", context)
-            return ADD_PORT
-        
-        context.user_data['new_device_port'] = port
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            f"Port: {port}\n\nStep 7/7: Enter SSH key path\n(Send /skip if not needed)",
-            context
-        )
-        return ADD_SSH_KEY
-    
-    async def add_device_skip_port(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        context.user_data['new_device_port'] = 22
-        
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        await self.update_status_message(
-            user_id, chat_id,
-            "Port: 22 (default)\n\nStep 7/7: Enter SSH key path\n(Send /skip if not needed)",
-            context
-        )
-        return ADD_SSH_KEY
-    
-    async def add_device_ssh_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        ssh_key = update.message.text.strip()
-        
-        # Validate SSH key path if provided
-        if ssh_key:
-            key_path = Path(ssh_key)
-            if not key_path.exists():
-                user_id = update.effective_user.id
-                chat_id = update.message.chat_id
-                await self.update_status_message(
-                    user_id, chat_id, 
-                    f"SSH key file not found: {ssh_key}\nPlease check the path and try again:", 
-                    context
-                )
-                return ADD_SSH_KEY
-            if not key_path.is_file():
-                user_id = update.effective_user.id
-                chat_id = update.message.chat_id
-                await self.update_status_message(
-                    user_id, chat_id, 
-                    f"SSH key path is not a file: {ssh_key}\nPlease provide a valid file path:", 
-                    context
-                )
-                return ADD_SSH_KEY
-        
-        context.user_data['new_device_ssh_key'] = ssh_key
-        return await self.add_device_confirm(update, context)
-    
-    async def add_device_skip_ssh_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        context.user_data['new_device_ssh_key'] = None
-        return await self.add_device_confirm(update, context)
-    
-    async def add_device_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id if update.message else update.callback_query.message.chat_id
-        
-        try:
-            device = Device(
-                name=context.user_data['new_device_name'],
-                ip=context.user_data['new_device_ip'],
-                mac=context.user_data['new_device_mac'],
-                os=context.user_data['new_device_os'],
-                user=context.user_data['new_device_user'],
-                ssh_key=context.user_data.get('new_device_ssh_key'),
-                port=context.user_data.get('new_device_port', 22)
-            )
-            
-            self.config.add_device(device)
-            
-            message = f"Device Added!\n\n{device.name}\nIP: {device.ip}\nMAC: {device.mac}\nOS: {device.os}"
-            
-            await self.update_status_message(user_id, chat_id, message, context)
-            
-            for msg_id in context.user_data.get('conversation_messages', []):
-                await self.delete_message_safe(chat_id, msg_id, context)
-            
-            context.user_data.clear()
-            
-            if user_id in self.user_menu_messages:
-                await self.refresh_menu(user_id, chat_id, context)
-            
-            return ConversationHandler.END
-            
-        except Exception as e:
-            await self.update_status_message(user_id, chat_id, f"Error: {str(e)}", context)
-            
-            for msg_id in context.user_data.get('conversation_messages', []):
-                await self.delete_message_safe(chat_id, msg_id, context)
-            
-            context.user_data.clear()
-            return ConversationHandler.END
-    
-    async def add_device_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        user_id = update.effective_user.id
-        chat_id = update.message.chat_id
-        
-        context.user_data['conversation_messages'].append(update.message.message_id)
-        
-        await self.update_status_message(user_id, chat_id, "Cancelled.", context)
-        
-        for msg_id in context.user_data.get('conversation_messages', []):
-            await self.delete_message_safe(chat_id, msg_id, context)
-        
-        context.user_data.clear()
-        return ConversationHandler.END
-    
-    async def remove_device_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        if not self.is_authorized(user_id):
-            await self.update_status_message(user_id, chat_id, "Access Denied", context)
-            return
-        
-        if not self.config.devices:
-            await self.update_status_message(user_id, chat_id, "No devices to remove", context)
-            return
-        
-        keyboard = []
-        for device_name in self.config.devices.keys():
-            keyboard.append([InlineKeyboardButton(f"🗑️ {device_name}", callback_data=f"remove:{device_name}")])
-        
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await self.update_status_message(user_id, chat_id, "Select device to remove:", context, reply_markup=reply_markup)
-    
-    async def remove_device_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        
-        device_name = query.data.split(":")[1]
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
+
+    def build_action_text(self, text: str = None) -> str:
+        """Build the action log message."""
+        if text:
+            return text
+        return "📋 Ready"
+
+    def build_panel_keyboard(self) -> InlineKeyboardMarkup:
+        """Build the control panel inline keyboard with dynamic buttons."""
         keyboard = [
             [
-                InlineKeyboardButton("✅ Yes", callback_data=f"remove_confirm:{device_name}"),
-                InlineKeyboardButton("❌ No", callback_data="cancel_remove")
+                InlineKeyboardButton("➕ Add", callback_data="add_device"),
+                InlineKeyboardButton("🗑️ Remove", callback_data="remove_device_menu"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats"),
             ]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if self.config.devices:
+            keyboard.append([InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")])
+            for name, device in self.config.devices.items():
+                # Device name is clickable — triggers status check
+                keyboard.append([InlineKeyboardButton(f"  {name}  ", callback_data=f"status:{name}")])
+                row = []
+                if device.wol_capable:
+                    row.append(InlineKeyboardButton("🟢", callback_data=f"wake:{name}"))
+                if device.ssh_capable:
+                    row.append(InlineKeyboardButton("🛑", callback_data=f"shutdown:{name}"))
+                    row.append(InlineKeyboardButton("🔄", callback_data=f"restart:{name}"))
+                    row.append(InlineKeyboardButton("💤", callback_data=f"sleep:{name}"))
+                if row:
+                    keyboard.append(row)
+
+        return InlineKeyboardMarkup(keyboard)
+
+    # ─── Message Management ─────────────────────────────────────
+
+    async def _edit_or_resend(self, chat_id: int, msg_id: int, text: str,
+                              context: ContextTypes.DEFAULT_TYPE,
+                              reply_markup=None) -> int:
+        """Try to edit a message. If it doesn't exist, send a new one.
+        Returns the (possibly new) message ID."""
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=text,
+                reply_markup=reply_markup
+            )
+            return msg_id
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                return msg_id
+            logger.debug(f"Edit failed (will resend): {e}")
+            msg = await context.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=reply_markup
+            )
+            return msg.message_id
+
+    async def _delete_safe(self, chat_id: int, message_id: int,
+                           context: ContextTypes.DEFAULT_TYPE):
+        """Delete a message, ignoring errors."""
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            logger.debug(f"Could not delete message {message_id}: {e}")
+
+    async def setup_messages(self, user_id: int, chat_id: int,
+                             context: ContextTypes.DEFAULT_TYPE):
+        """
+        Create or recover the 3 persistent messages.
         
-        await self.update_status_message(
+        Order: Panel (top) → Stats (middle) → Action (bottom)
+        """
+        stored = self.state.get_telegram_user(user_id)
+
+        if stored:
+            # Try to reuse existing messages
+            try:
+                panel_id = await self._edit_or_resend(
+                    chat_id, stored["panel_msg_id"],
+                    "🎛 Device Control Panel", context,
+                    reply_markup=self.build_panel_keyboard()
+                )
+                stats_id = await self._edit_or_resend(
+                    chat_id, stored["stats_msg_id"],
+                    self.build_stats_text(), context
+                )
+                action_id = await self._edit_or_resend(
+                    chat_id, stored["action_msg_id"],
+                    self.build_action_text(), context
+                )
+                self.state.set_telegram_user(
+                    user_id, chat_id, stats_id, action_id, panel_id
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Could not recover messages, creating fresh: {e}")
+
+        # Send fresh messages: Panel → Stats → Action
+        panel_msg = await context.bot.send_message(
+            chat_id=chat_id, text="🎛 Device Control Panel",
+            reply_markup=self.build_panel_keyboard()
+        )
+        stats_msg = await context.bot.send_message(
+            chat_id=chat_id, text=self.build_stats_text()
+        )
+        action_msg = await context.bot.send_message(
+            chat_id=chat_id, text=self.build_action_text()
+        )
+
+        self.state.set_telegram_user(
             user_id, chat_id,
-            f"Remove {device_name}?\n\nThis cannot be undone.",
-            context,
+            stats_msg.message_id,
+            action_msg.message_id,
+            panel_msg.message_id
+        )
+
+    async def update_stats(self, user_id: int = None, context: ContextTypes.DEFAULT_TYPE = None):
+        """Refresh the stats dashboard message for one or all users."""
+        text = self.build_stats_text()
+
+        if user_id and context:
+            stored = self.state.get_telegram_user(user_id)
+            if stored:
+                new_id = await self._edit_or_resend(
+                    stored["chat_id"], stored["stats_msg_id"], text, context
+                )
+                if new_id != stored["stats_msg_id"]:
+                    self.state.update_telegram_msg(user_id, "stats_msg_id", new_id)
+            return
+
+        # Refresh for all users (called by monitor)
+        if not self.app:
+            return
+        text = self.build_stats_text()
+        for uid_str, stored in self.state.state["telegram"].items():
+            try:
+                new_id = await self._edit_or_resend(
+                    stored["chat_id"], stored["stats_msg_id"], text,
+                    self.app
+                )
+                if new_id != stored["stats_msg_id"]:
+                    self.state.update_telegram_msg(int(uid_str), "stats_msg_id", new_id)
+            except Exception as e:
+                logger.debug(f"Stats refresh failed for user {uid_str}: {e}")
+
+    async def update_action(self, user_id: int, chat_id: int, text: str,
+                            context: ContextTypes.DEFAULT_TYPE,
+                            reply_markup=None):
+        """Update the action log message (message 2)."""
+        stored = self.state.get_telegram_user(user_id)
+        if not stored:
+            return
+        new_id = await self._edit_or_resend(
+            chat_id, stored["action_msg_id"], text, context,
             reply_markup=reply_markup
         )
-    
-    async def remove_device_execute(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        
-        device_name = query.data.split(":")[1]
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        if self.config.remove_device(device_name):
-            await self.update_status_message(user_id, chat_id, f"{device_name} removed!", context)
-            
-            if user_id in self.user_menu_messages:
-                await self.refresh_menu(user_id, chat_id, context)
-        else:
-            await self.update_status_message(user_id, chat_id, f"Failed to remove {device_name}", context)
-    
-    async def cancel_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        await self.update_status_message(user_id, chat_id, "Cancelled.", context)
-    
-    async def list_devices_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        if not self.config.devices:
-            await self.update_status_message(user_id, chat_id, "No devices configured", context)
+        if new_id != stored["action_msg_id"]:
+            self.state.update_telegram_msg(user_id, "action_msg_id", new_id)
+
+    async def update_panel(self, user_id: int, chat_id: int,
+                           context: ContextTypes.DEFAULT_TYPE):
+        """Refresh the control panel keyboard (message 3)."""
+        stored = self.state.get_telegram_user(user_id)
+        if not stored:
             return
-        
-        message = "Configured Devices:\n\n"
-        for name, device in self.config.devices.items():
-            message += f"{name}\n"
-            message += f"• IP: {device.ip}\n"
-            message += f"• MAC: {device.mac}\n"
-            message += f"• OS: {device.os}\n"
-            message += f"• User: {device.user}\n"
-            message += f"• Port: {device.port}\n"
-            if device.ssh_key:
-                message += f"• SSH Key: {device.ssh_key}\n"
-            message += "\n"
-        
-        await self.update_status_message(user_id, chat_id, message, context)
-    
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        if not self.is_authorized(user_id):
+        new_id = await self._edit_or_resend(
+            chat_id, stored["panel_msg_id"],
+            "🎛 Device Control Panel", context,
+            reply_markup=self.build_panel_keyboard()
+        )
+        if new_id != stored["panel_msg_id"]:
+            self.state.update_telegram_msg(user_id, "panel_msg_id", new_id)
+
+    # ─── Command Handlers ───────────────────────────────────────
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start — create panel only if one doesn't already exist."""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if user_id not in self.config.telegram_authorized_users:
             return
-        
-        if query.data == "none":
+
+        # Delete the command message
+        await self._delete_safe(chat_id, update.message.message_id, context)
+
+        # If panel already exists, do nothing (prevents loop on restart)
+        stored = self.state.get_telegram_user(user_id)
+        if stored:
             return
-        
-        if query.data == "remove_device_menu":
-            return await self.remove_device_menu(update, context)
-        
-        if query.data.startswith("remove:") and not query.data.startswith("remove_confirm:"):
-            return await self.remove_device_confirm(update, context)
-        
-        if query.data.startswith("remove_confirm:"):
-            return await self.remove_device_execute(update, context)
-        
-        if query.data == "cancel_remove":
-            return await self.cancel_remove(update, context)
-        
-        if query.data == "list_devices":
-            return await self.list_devices_callback(update, context)
-        
+
+        # No panel exists — create one
+        await self.setup_messages(user_id, chat_id, context)
+
+    async def panel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /panel — force-delete old panel and recreate cleanly."""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if user_id not in self.config.telegram_authorized_users:
+            return
+
+        # Prevent double-processing if /panel is sent rapidly
+        lock_key = f"panel_lock_{user_id}"
+        if context.bot_data.get(lock_key):
+            return
+        context.bot_data[lock_key] = True
+
         try:
-            action, device_name = query.data.split(":", 1)
+            # Delete the command message itself
+            await self._delete_safe(chat_id, update.message.message_id, context)
+
+            # Delete stored bot messages only
+            stored = self.state.get_telegram_user(user_id)
+            if stored:
+                for key in ("panel_msg_id", "stats_msg_id", "action_msg_id"):
+                    if key in stored:
+                        await self._delete_safe(chat_id, stored[key], context)
+
+            self.state.clear_telegram_user(user_id)
+
+            # Create fresh messages
+            await self.setup_messages(user_id, chat_id, context)
+        finally:
+            context.bot_data[lock_key] = False
+
+    # ─── Button Callbacks ───────────────────────────────────────
+
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline keyboard button presses."""
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.debug(f"Could not answer callback: {e}")
+
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+
+        if user_id not in self.config.telegram_authorized_users:
+            return
+        if query.data == "noop":
+            return
+
+        # Refresh stats
+        if query.data == "refresh_stats":
+            await self.update_action(user_id, chat_id, "🔄 Refreshing...", context)
+            
+            async def _check(n, d):
+                return n, await self.executor.check_device_status(d, timeout=5)
+            
+            results = await asyncio.gather(*[_check(n, d) for n, d in self.config.devices.items()])
+            for n, online in results:
+                self.state.update_device_status(n, online, save=False)
+            self.state.save()
+            
+            await self.update_stats(user_id, context)
+            await self.update_action(user_id, chat_id, "✅ Stats refreshed!", context)
+            return
+
+        # Remove device menu
+        if query.data == "remove_device_menu":
+            if not self.config.devices:
+                await self.update_action(
+                    user_id, chat_id, "❌ No devices to remove.", context
+                )
+                return
+            kb = [
+                [InlineKeyboardButton(f"🗑️ {n}", callback_data=f"remove:{n}")]
+                for n in self.config.devices.keys()
+            ]
+            kb.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove")])
+            await self.update_action(
+                user_id, chat_id, "Select device to remove:",
+                context, reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+
+        if query.data.startswith("remove:") and not query.data.startswith("remove_confirm:"):
+            name = query.data.split(":", 1)[1]
+            kb = [[
+                InlineKeyboardButton("✅ Yes", callback_data=f"remove_confirm:{name}"),
+                InlineKeyboardButton("❌ No", callback_data="cancel_remove")
+            ]]
+            await self.update_action(
+                user_id, chat_id, f"⚠️ Remove {name}?",
+                context, reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+
+        if query.data.startswith("remove_confirm:"):
+            name = query.data.split(":", 1)[1]
+            if self.config.remove_device(name):
+                self.state.remove_device_stats(name)
+                await self.update_action(
+                    user_id, chat_id, f"🗑️ {name} removed!", context
+                )
+                await self.update_panel(user_id, chat_id, context)
+                await self.update_stats(user_id, context)
+            return
+
+        if query.data == "cancel_remove":
+            await self.update_action(
+                user_id, chat_id, self.build_action_text(), context
+            )
+            return
+
+        # Device actions
+        try:
+            action, name = query.data.split(":", 1)
         except ValueError:
             return
-        
-        await self._execute_device_action(action, device_name, user_id, query.message.chat_id, context)
-    
-    async def _execute_device_action(self, action: str, device_name: str, user_id: int, 
-                                   chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-        device = self.config.devices.get(device_name)
+
+        device = self.config.devices.get(name)
         if not device:
-            await self.update_status_message(user_id, chat_id, f"Device '{device_name}' not found", context)
             return
-        
-        # Show warning if other tasks are running (but allow concurrent execution)
-        active_info = await self.get_active_tasks_info(device_name)
-        if active_info:
-            logger.info(f"Concurrent task detected: {active_info}")
-        
-        # Create async task wrapper for the action
-        async def action_wrapper():
+
+        # Run device action in a background task
+        async def run_action():
             try:
                 if action == 'wake':
-                    await self._wake_device(device, user_id, chat_id, context)
-                elif action == 'shutdown':
-                    await self._shutdown_device(device, user_id, chat_id, context)
-                elif action == 'restart':
-                    await self._restart_device(device, user_id, chat_id, context)
-                elif action == 'sleep':
-                    await self._sleep_device(device, user_id, chat_id, context)
+                    await self.update_action(
+                        user_id, chat_id,
+                        f"🟢 {name}\n📡 Sending WOL packet...", context
+                    )
+                    await self.executor.wake_device(device.mac)
+                    await self.update_action(
+                        user_id, chat_id,
+                        f"🟢 {name}\n📡 WOL sent, waiting for response...", context
+                    )
+                    await asyncio.sleep(2)
+                    for i in range(12):
+                        if await self.executor.ping_device(device.ip):
+                            self.state.update_device_status(name, True)
+                            await self.update_action(
+                                user_id, chat_id,
+                                f"✅ {name}\n🟢 ONLINE", context
+                            )
+                            await self.update_stats(user_id, context)
+                            return
+                        await self.update_action(
+                            user_id, chat_id,
+                            f"🟢 {name}\n🔍 Pinging... ({i+1}/12)", context
+                        )
+                        await asyncio.sleep(5)
+                    await self.update_action(
+                        user_id, chat_id,
+                        f"⚠️ {name}\n❌ Timeout — device did not respond", context
+                    )
+
                 elif action == 'status':
-                    await self._status_device(device, user_id, chat_id, context)
-                else:
-                    await self.update_status_message(user_id, chat_id, f"Unknown action: {action}", context)
+                    await self.update_action(
+                        user_id, chat_id,
+                        f"🔍 {name}\n⏳ Checking...", context
+                    )
+                    online = await self.executor.check_device_status(device, timeout=5)
+                    self.state.update_device_status(name, online)
+                    if online:
+                        await self.update_action(
+                            user_id, chat_id,
+                            f"✅ {name}  🟢 Online", context
+                        )
+                    else:
+                        await self.update_action(
+                            user_id, chat_id,
+                            f"❌ {name}  🔴 Offline", context
+                        )
+                    await self.update_stats(user_id, context)
+
+                elif action in ('shutdown', 'restart', 'sleep'):
+                    cmd_map = {
+                        'shutdown': self.executor.get_shutdown_command(device),
+                        'restart': self.executor.get_restart_command(device),
+                        'sleep': self.executor.get_sleep_command(device),
+                    }
+                    cmd = cmd_map.get(action, "")
+                    if not cmd:
+                        await self.update_action(
+                            user_id, chat_id,
+                            f"❌ {action.capitalize()} not supported for {device.os}", context
+                        )
+                        return
+
+                    emoji = {'shutdown': '🛑', 'restart': '🔄', 'sleep': '💤'}[action]
+                    await self.update_action(
+                        user_id, chat_id,
+                        f"{emoji} {name}\n⏳ Sending {action} command...", context
+                    )
+                    ok, out = await self.executor.ssh_command(device, cmd)
+                    if ok or action in ('shutdown', 'restart'):
+                        # SSH connection drop is expected for shutdown/restart  
+                        await self.update_action(
+                            user_id, chat_id,
+                            f"{emoji} {name}\n✅ {action.capitalize()} command sent", context
+                        )
+                        # Update stats after a delay
+                        await asyncio.sleep(5)
+                        online = await self.executor.ping_device(device.ip)
+                        self.state.update_device_status(name, online)
+                        await self.update_stats(user_id, context)
+                    else:
+                        await self.update_action(
+                            user_id, chat_id,
+                            f"❌ {name}\n{action.capitalize()} failed: {out}", context
+                        )
+
             except Exception as e:
-                logger.error(f"Action failed: {action} on {device_name}: {e}", exc_info=True)
-                error_msg = f"❌ Action Failed\nDevice: {device.name}\nAction: {action}\nError: {str(e)}"
-                await self.update_status_message(user_id, chat_id, error_msg, context)
-        
-        # Fire and forget - don't await, let it run in background
-        asyncio.create_task(self.execute_task_with_tracking(device_name, action_wrapper()))
-    
-    async def _wake_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"Waking device {device.name} ({device.ip})")
-        
-        # Run blocking WOL function in executor to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, send_magic_packet, device.mac)
-        logger.debug(f"Wake-on-LAN packet sent to {device.mac}")
-        
-        await self._update_message(user_id, chat_id, f"🔍 {device.name}\n📡 Wake-on-LAN sent...", context)
-        await asyncio.sleep(2)
-        await self._update_message(user_id, chat_id, f"🔍 {device.name}\n⏳ Waiting for response...", context)
-        
-        for attempt in range(BotConfig.WAKE_MAX_ATTEMPTS):
-            is_up = await self.executor.ping_device(device.ip)
-            if is_up:
-                logger.info(f"Device {device.name} is now UP after {attempt + 1} attempts")
-                await self._update_message(user_id, chat_id, f"✅ {device.name}\n🟢 Device is ONLINE", context)
-                return
-            await asyncio.sleep(BotConfig.WAKE_CHECK_INTERVAL)
-        
-        total_time = BotConfig.WAKE_MAX_ATTEMPTS * BotConfig.WAKE_CHECK_INTERVAL
-        logger.warning(f"Device {device.name} did not start within {total_time} seconds")
-        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Device did not start within {total_time}s\n🔍 Check manually", context)
-    
-    async def _shutdown_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"Shutting down device {device.name} ({device.ip})")
-        shutdown_cmd = "shutdown /s /t 0" if device.os.lower() == 'windows' else "sudo -n /sbin/shutdown -h now"
-        
-        await self._update_message(user_id, chat_id, f"🛑 {device.name}\n⏳ Sending shutdown command...", context)
-        
-        success, output = await self.executor.ssh_command(device, shutdown_cmd)
-        
-        if not success:
-            logger.error(f"Shutdown failed for {device.name}: {output}")
-            await self._update_message(user_id, chat_id, f"❌ {device.name}\n💥 Shutdown failed\n📝 {output}", context)
-            return
-        
-        logger.debug(f"Shutdown command sent to {device.name}, waiting for device to go down")
-        await self._update_message(user_id, chat_id, f"🛑 {device.name}\n📡 Command sent, waiting...", context)
-        
-        for attempt in range(BotConfig.SHUTDOWN_MAX_ATTEMPTS):
-            await asyncio.sleep(BotConfig.SHUTDOWN_CHECK_INTERVAL)
-            is_up = await self.executor.ping_device(device.ip)
-            if not is_up:
-                logger.info(f"Device {device.name} is now DOWN after {attempt + 1} attempts")
-                await self._update_message(user_id, chat_id, f"✅ {device.name}\n🔴 Device is OFFLINE", context)
-                return
-        
-        total_time = BotConfig.SHUTDOWN_MAX_ATTEMPTS * BotConfig.SHUTDOWN_CHECK_INTERVAL
-        logger.warning(f"Device {device.name} is still UP after {total_time} seconds")
-        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n🟡 Still running after {total_time}s\n🔍 Check manually", context)
-    
-    async def _restart_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"Restarting device {device.name} ({device.ip})")
-        restart_cmd = "shutdown /r /t 0" if device.os.lower() == 'windows' else "sudo -n reboot now"
-        
-        await self._update_message(user_id, chat_id, f"🔄 {device.name}\n⏳ Sending restart command...", context)
-        
-        success, output = await self.executor.ssh_command(device, restart_cmd)
-        
-        if not success:
-            logger.error(f"Restart failed for {device.name}: {output}")
-            await self._update_message(user_id, chat_id, f"❌ {device.name}\n💥 Restart failed\n📝 {output}", context)
-            return
-        
-        logger.debug(f"Restart command sent to {device.name}, waiting for device to go down")
-        await self._update_message(user_id, chat_id, f"🔄 {device.name}\n📡 Command sent, waiting...", context)
-        
-        await asyncio.sleep(BotConfig.RESTART_INITIAL_WAIT)
-        
-        down_detected = False
-        for attempt in range(BotConfig.RESTART_DOWN_CHECK_ATTEMPTS):
-            await asyncio.sleep(BotConfig.RESTART_CHECK_INTERVAL)
-            is_up = await self.executor.ping_device(device.ip)
-            if not is_up:
-                down_detected = True
-                logger.debug(f"Device {device.name} went down after {attempt + 1} attempts")
-                break
-        
-        if not down_detected:
-            logger.warning(f"Device {device.name} did not go down, restart may have failed")
-            await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Did not go down\n🔍 Restart may have failed", context)
-            return
-        
-        logger.debug(f"Device {device.name} is down, waiting for it to come back up")
-        await self._update_message(user_id, chat_id, f"🔄 {device.name}\n🔴 Device is down\n⏳ Booting up...", context)
-        
-        for attempt in range(BotConfig.RESTART_MAX_ATTEMPTS):
-            await asyncio.sleep(BotConfig.RESTART_CHECK_INTERVAL)
-            is_up = await self.executor.ping_device(device.ip)
-            if is_up:
-                logger.info(f"Device {device.name} is UP after restart")
-                await self._update_message(user_id, chat_id, f"✅ {device.name}\n🟢 Restart complete!", context)
-                return
-        
-        total_time = BotConfig.RESTART_MAX_ATTEMPTS * BotConfig.RESTART_CHECK_INTERVAL
-        logger.warning(f"Device {device.name} did not come back up within {total_time} seconds")
-        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Did not boot within {total_time}s\n🔍 Check manually", context)
-    
-    async def _sleep_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        if device.os.lower() != 'windows':
-            logger.warning(f"Sleep command attempted on non-Windows device: {device.name} ({device.os})")
-            await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n❌ Windows only\n🖥️ Running: {device.os}", context)
-            return
-        
-        logger.info(f"Putting device {device.name} ({device.ip}) to sleep")
-        sleep_cmd = "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"
-        
-        await self._update_message(user_id, chat_id, f"💤 {device.name}\n⏳ Sending sleep command...", context)
-        
-        success, output = await self.executor.ssh_command(device, sleep_cmd)
-        
-        if not success:
-            logger.error(f"Sleep failed for {device.name}: {output}")
-            await self._update_message(user_id, chat_id, f"❌ {device.name}\n💥 Sleep failed\n📝 {output}", context)
-            return
-        
-        logger.debug(f"Sleep command sent to {device.name}, waiting for device to sleep")
-        await self._update_message(user_id, chat_id, f"💤 {device.name}\n📡 Command sent...", context)
-        
-        for attempt in range(BotConfig.SLEEP_MAX_ATTEMPTS):
-            await asyncio.sleep(BotConfig.SLEEP_CHECK_INTERVAL)
-            is_up = await self.executor.ping_device(device.ip)
-            if not is_up:
-                logger.info(f"Device {device.name} is now sleeping or down after {attempt + 1} attempts")
-                await self._update_message(user_id, chat_id, f"✅ {device.name}\n💤 Device is sleeping", context)
-                return
-        
-        total_time = BotConfig.SLEEP_MAX_ATTEMPTS * BotConfig.SLEEP_CHECK_INTERVAL
-        logger.warning(f"Device {device.name} is still UP after {total_time} seconds")
-        await self._update_message(user_id, chat_id, f"⚠️ {device.name}\n🟡 Still running after {total_time}s\n🔍 Check manually", context)
-    
-    async def _status_device(self, device: Device, user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        logger.debug(f"Checking status of {device.name} ({device.ip})")
-        await self._update_message(user_id, chat_id, f"📊 {device.name}\n🔍 Checking status...", context)
-        
-        is_ping_up = await self.executor.ping_device(device.ip)
-        
-        if is_ping_up:
-            logger.debug(f"Device {device.name} is UP (responds to ping)")
-            await self._update_message(user_id, chat_id, f"📊 {device.name}\n🟢 ONLINE (ping OK)", context)
-        else:
-            success, output = await self.executor.ssh_command(device, "echo 'SSH test'", timeout=5)
-            
-            if success:
-                logger.debug(f"Device {device.name} is UP (SSH accessible, ping blocked)")
-                await self._update_message(user_id, chat_id, f"📊 {device.name}\n🟡 ONLINE (SSH OK, ping blocked)", context)
-            else:
-                logger.debug(f"Device {device.name} is DOWN (no response to ping or SSH)")
-                await self._update_message(user_id, chat_id, f"📊 {device.name}\n🔴 OFFLINE", context)
-    
-    def create_device_command_handler(self, action: str, device_name: str) -> Callable:
-        async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            user_id = update.effective_user.id
-            if not self.is_authorized(user_id):
-                return await self.send_unauthorized(update)
-            
-            chat_id = update.message.chat_id
-            await self._execute_device_action(action, device_name, user_id, chat_id, context)
-            await self.delete_message_safe(chat_id, update.message.message_id, context)
-        
-        return handler
-    
-    def run(self):
+                logger.error(f"Action {action} on {name} failed: {e}")
+                await self.update_action(
+                    user_id, chat_id,
+                    f"❌ Error: {e}", context
+                )
+
+        task = asyncio.create_task(run_action())
+        task.add_done_callback(
+            lambda t: logger.error(f"Unhandled: {t.exception()}")
+            if not t.cancelled() and t.exception() else None
+        )
+
+    # ─── Add Device Conversation ────────────────────────────────
+
+    async def add_device_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Start the add-device conversation."""
+        query = update.callback_query
+        if query:
+            await query.answer()
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        context.user_data.clear()
+        await self.update_action(
+            user_id, chat_id,
+            "➕ Add Device\n━━━━━━━━━━━━━━━\nStep 1: Enter device name", context
+        )
+        return ADD_NAME
+
+    async def add_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        name = update.message.text.strip()
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        await self._delete_safe(chat_id, update.message.message_id, context)
+
+        if not name or len(name) > 32:
+            await self.update_action(
+                user_id, chat_id,
+                "❌ Name must be 1-32 characters.\n\nStep 1: Enter device name", context
+            )
+            return ADD_NAME
+        if name in self.config.devices:
+            await self.update_action(
+                user_id, chat_id,
+                f"❌ '{name}' already exists.\n\nStep 1: Enter device name", context
+            )
+            return ADD_NAME
+
+        context.user_data['add_name'] = name
+        await self.update_action(
+            user_id, chat_id,
+            f"✓ Name: {name}\n\nStep 2: Enter IP address", context
+        )
+        return ADD_IP
+
+    async def add_ip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        ip = update.message.text.strip()
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        await self._delete_safe(chat_id, update.message.message_id, context)
+
         try:
-            self.config.load_config()
-            logger.info(f"Loaded {len(self.config.devices)} devices")
-            logger.info(f"Authorized user IDs: {', '.join(map(str, self.config.authorized_user_ids))}")
-        except Exception as e:
-            logger.error(f"Configuration error: {e}", exc_info=True)
-            sys.exit(1)
+            ipaddress.ip_address(ip)
+        except ValueError:
+            await self.update_action(
+                user_id, chat_id,
+                "❌ Invalid IP address.\n\nStep 2: Enter IP address", context
+            )
+            return ADD_IP
+
+        context.user_data['add_ip'] = ip
+        kb = [[InlineKeyboardButton(o, callback_data=f"os:{o.lower()}")]
+              for o in ["Windows", "Linux", "macOS"]]
+        await self.update_action(
+            user_id, chat_id,
+            f"✓ Name: {context.user_data['add_name']}\n"
+            f"✓ IP: {ip}\n\nStep 3: Select OS",
+            context, reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return ADD_OS
+
+    async def add_os(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        os_name = query.data.split(":", 1)[1]
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+
+        context.user_data['add_os'] = os_name
+        kb = [
+            [InlineKeyboardButton("✅ Yes", callback_data="wol:yes"),
+             InlineKeyboardButton("❌ No", callback_data="wol:no")]
+        ]
+        await self.update_action(
+            user_id, chat_id,
+            f"✓ Name: {context.user_data['add_name']}\n"
+            f"✓ IP: {context.user_data['add_ip']}\n"
+            f"✓ OS: {os_name}\n\nStep 4: Does this device support Wake-on-LAN?",
+            context, reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return ADD_WOL
+
+    async def add_wol(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        wol = query.data.split(":", 1)[1] == "yes"
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+
+        context.user_data['add_wol'] = wol
+
+        if wol:
+            await self.update_action(
+                user_id, chat_id,
+                f"✓ Name: {context.user_data['add_name']}\n"
+                f"✓ IP: {context.user_data['add_ip']}\n"
+                f"✓ OS: {context.user_data['add_os']}\n"
+                f"✓ WoL: Yes\n\nStep 5: Enter MAC address (AA:BB:CC:DD:EE:FF)",
+                context
+            )
+            return ADD_MAC
+        else:
+            context.user_data['add_mac'] = ''
+            kb = [
+                [InlineKeyboardButton("✅ Yes (SSH)", callback_data="ssh:yes"),
+                 InlineKeyboardButton("❌ No (Ping only)", callback_data="ssh:no")]
+            ]
+            await self.update_action(
+                user_id, chat_id,
+                f"✓ Name: {context.user_data['add_name']}\n"
+                f"✓ IP: {context.user_data['add_ip']}\n"
+                f"✓ OS: {context.user_data['add_os']}\n"
+                f"✓ WoL: No\n\nStep 5: Can this device be managed via SSH?",
+                context, reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return ADD_SSH
+
+    async def add_mac(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        mac = update.message.text.strip().upper()
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        await self._delete_safe(chat_id, update.message.message_id, context)
+
+        mac_pattern = re.compile(r'^([0-9A-F]{2}[:-]){5}[0-9A-F]{2}$')
+        if not mac_pattern.match(mac):
+            await self.update_action(
+                user_id, chat_id,
+                "❌ Invalid MAC. Format: AA:BB:CC:DD:EE:FF\n\n"
+                "Enter MAC address:", context
+            )
+            return ADD_MAC
+
+        context.user_data['add_mac'] = mac
+        kb = [
+            [InlineKeyboardButton("✅ Yes (SSH)", callback_data="ssh:yes"),
+             InlineKeyboardButton("❌ No (Ping only)", callback_data="ssh:no")]
+        ]
+        await self.update_action(
+            user_id, chat_id,
+            f"✓ Name: {context.user_data['add_name']}\n"
+            f"✓ IP: {context.user_data['add_ip']}\n"
+            f"✓ OS: {context.user_data['add_os']}\n"
+            f"✓ WoL: Yes\n"
+            f"✓ MAC: {mac}\n\nStep 6: Can this device be managed via SSH?",
+            context, reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return ADD_SSH
+
+    async def add_ssh(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        ssh = query.data.split(":", 1)[1] == "yes"
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+
+        context.user_data['add_ssh'] = ssh
+
+        if ssh:
+            await self.update_action(
+                user_id, chat_id,
+                f"✓ Name: {context.user_data['add_name']}\n"
+                f"✓ IP: {context.user_data['add_ip']}\n"
+                f"✓ OS: {context.user_data['add_os']}\n"
+                f"✓ WoL: {'Yes' if context.user_data['add_wol'] else 'No'}\n"
+                f"✓ SSH: Yes\n\nFinal step: Enter SSH username",
+                context
+            )
+            return ADD_USER
+        else:
+            # Ping-only device — create immediately
+            return await self._finish_add_device(user_id, chat_id, '', context)
+
+    async def add_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        ssh_user = update.message.text.strip()
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        await self._delete_safe(chat_id, update.message.message_id, context)
+        return await self._finish_add_device(user_id, chat_id, ssh_user, context)
+
+    async def _finish_add_device(self, user_id, chat_id, ssh_user, context) -> int:
+        """Create the device and update the UI."""
+        device = Device(
+            name=context.user_data['add_name'],
+            ip=context.user_data['add_ip'],
+            mac=context.user_data.get('add_mac', ''),
+            os=context.user_data['add_os'],
+            user=ssh_user,
+            wol_capable=context.user_data.get('add_wol', False),
+            ssh_capable=context.user_data.get('add_ssh', False)
+        )
+        self.config.add_device(device)
+
+        caps = []
+        if device.wol_capable:
+            caps.append("WoL")
+        if device.ssh_capable:
+            caps.append("SSH")
+        if not caps:
+            caps.append("Ping only")
+
+        await self.update_action(
+            user_id, chat_id,
+            f"✅ Device added!\n\n"
+            f"Name: {device.name}\n"
+            f"IP: {device.ip}\n"
+            f"OS: {device.os}\n"
+            f"Capabilities: {', '.join(caps)}", context
+        )
+        await self.update_panel(user_id, chat_id, context)
+        return ConversationHandler.END
+
+    async def add_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Cancel the add-device flow."""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        if update.message:
+            await self._delete_safe(chat_id, update.message.message_id, context)
+        await self.update_action(
+            user_id, chat_id, self.build_action_text(), context
+        )
+        return ConversationHandler.END
+
+    # ─── Monitor Callback ───────────────────────────────────────
+
+    async def on_monitor_refresh(self):
+        """Called by DeviceMonitor after each check cycle.
         
-        app = ApplicationBuilder().token(self.config.token).build()
-        
-        app.add_handler(CommandHandler("start", self.start_command))
-        app.add_handler(CommandHandler("help", self.help_command))
-        app.add_handler(CommandHandler("menu", self.menu_command))
-        app.add_handler(CommandHandler("list", self.list_command))
-        
-        add_device_handler = ConversationHandler(
+        Refreshes the stats message for all Telegram users.
+        Uses the bot's application context directly.
+        """
+        if not self.app:
+            return
+        text = self.build_stats_text()
+        for uid_str, stored in list(self.state.state["telegram"].items()):
+            try:
+                await self.app.bot.edit_message_text(
+                    chat_id=stored["chat_id"],
+                    message_id=stored["stats_msg_id"],
+                    text=text
+                )
+            except Exception as e:
+                if "Message is not modified" not in str(e):
+                    logger.debug(f"Stats refresh for {uid_str}: {e}")
+
+    # ─── Bot Setup & Run ────────────────────────────────────────
+
+    def build_application(self):
+        """Build and configure the Telegram application."""
+        self.app = (
+            ApplicationBuilder()
+            .token(self.config.telegram_token)
+            .connect_timeout(30)
+            .read_timeout(30)
+            .write_timeout(30)
+            .build()
+        )
+
+        # Commands — /start is safe (no-op if panel exists), /panel force-recreates
+        self.app.add_handler(CommandHandler("panel", self.panel_command))
+        self.app.add_handler(CommandHandler("start", self.start_command))
+
+        # Add device conversation
+        self.app.add_handler(ConversationHandler(
             entry_points=[
-                CommandHandler("add_device", self.add_device_start),
                 CallbackQueryHandler(self.add_device_start, pattern="^add_device$")
             ],
             states={
-                ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_device_name)],
-                ADD_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_device_ip)],
-                ADD_MAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_device_mac)],
-                ADD_OS: [CallbackQueryHandler(self.add_device_os, pattern="^os:")],
-                ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_device_user)],
-                ADD_PORT: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_device_port),
-                    CommandHandler("skip", self.add_device_skip_port)
-                ],
-                ADD_SSH_KEY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_device_ssh_key),
-                    CommandHandler("skip", self.add_device_skip_ssh_key)
-                ],
+                ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_name)],
+                ADD_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_ip)],
+                ADD_OS: [CallbackQueryHandler(self.add_os, pattern="^os:")],
+                ADD_WOL: [CallbackQueryHandler(self.add_wol, pattern="^wol:")],
+                ADD_MAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_mac)],
+                ADD_SSH: [CallbackQueryHandler(self.add_ssh, pattern="^ssh:")],
+                ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_user)],
             },
-            fallbacks=[CommandHandler("cancel", self.add_device_cancel)],
-        )
-        app.add_handler(add_device_handler)
-        
-        app.add_handler(CallbackQueryHandler(self.button_callback))
-        
-        for device_name in self.config.devices:
-            for action in ["wake", "shutdown", "restart", "status"]:
-                command_name = f"{action}_{self.format_device_key(device_name)}"
-                handler = self.create_device_command_handler(action, device_name)
-                app.add_handler(CommandHandler(command_name, handler))
-            
-            device = self.config.devices[device_name]
-            if device.os.lower() == 'windows':
-                command_name = f"sleep_{self.format_device_key(device_name)}"
-                handler = self.create_device_command_handler("sleep", device_name)
-                app.add_handler(CommandHandler(command_name, handler))
-        
-        logger.info("Starting Telegram Device Management Bot...")
-        logger.info("Bot is ready!")
+            fallbacks=[CommandHandler("cancel", self.add_cancel)],
+            per_message=False,
+        ))
+
+        # General button callback (must be after ConversationHandler)
+        self.app.add_handler(CallbackQueryHandler(self.button_callback))
+
+        return self.app
+
+    async def start_polling(self):
+        """Start the bot polling with retry on network failures."""
+        app = self.build_application()
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                await app.initialize()
+                await app.start()
+                await app.updater.start_polling(drop_pending_updates=True)
+                logger.info("Telegram bot started polling")
+                return
+            except Exception as e:
+                if attempt < max_retries:
+                    wait = attempt * 5
+                    logger.warning(
+                        f"Telegram connect failed (attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Telegram connect failed after {max_retries} attempts: {e}")
+                    raise
+
+    async def stop_polling(self):
+        """Stop the bot polling."""
+        if self.app:
+            await self.app.updater.stop()
+            await self.app.stop()
+            await self.app.shutdown()
+            logger.info("Telegram bot stopped")
+
+    def run(self):
+        """Standalone run (for backward compatibility / simple usage)."""
+        app = self.build_application()
         app.run_polling()
-
-def main():
-    try:
-        bot = DeviceBot()
-        bot.run()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
-
-if __name__ == '__main__':
-    main()
