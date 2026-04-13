@@ -74,12 +74,12 @@ async def main():
 
     if config.failover_enabled:
         if config.is_primary:
-            heartbeat = HeartbeatServer(config.heartbeat_port)
+            heartbeat = HeartbeatServer(config.heartbeat_port, config, state)
             heartbeat.start()
             logger.info(f"Running as PRIMARY ({config.node_name})")
         else:
             watcher = FailoverWatcher(
-                config.peer_ip, config.heartbeat_port,
+                config.peer_ip, config.heartbeat_port, config, state,
                 check_interval=10, fail_threshold=3
             )
             logger.info(f"Running as BACKUP ({config.node_name})")

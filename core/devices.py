@@ -113,24 +113,33 @@ class ConfigManager:
 
         # Devices
         if self.devices_file.exists():
-            try:
-                with open(self.devices_file, "r") as f:
-                    devices_data = json.load(f)
-                    for name, config in devices_data.items():
-                        self.devices[name] = Device(
-                            name=name,
-                            ip=config['ip'],
-                            mac=config.get('mac', ''),
-                            os=config.get('os', 'linux'),
-                            user=config.get('user', ''),
-                            ssh_key=config.get('ssh_key'),
-                            port=config.get('port', 22),
-                            wol_capable=config.get('wol_capable', True),
-                            ssh_capable=config.get('ssh_capable', True)
-                        )
-                logger.info(f"Loaded {len(self.devices)} devices from {self.devices_file}")
-            except Exception as e:
-                logger.error(f"Failed to load devices: {e}")
+            self.reload_devices()
+
+    def reload_devices(self):
+        """Reload only the devices from devices.json without re-evaluating .env."""
+        if not self.devices_file.exists():
+            return
+            
+        try:
+            with open(self.devices_file, "r") as f:
+                devices_data = json.load(f)
+                
+            self.devices.clear()
+            for name, config in devices_data.items():
+                self.devices[name] = Device(
+                    name=name,
+                    ip=config['ip'],
+                    mac=config.get('mac', ''),
+                    os=config.get('os', 'linux'),
+                    user=config.get('user', ''),
+                    ssh_key=config.get('ssh_key'),
+                    port=config.get('port', 22),
+                    wol_capable=config.get('wol_capable', True),
+                    ssh_capable=config.get('ssh_capable', True)
+                )
+            logger.info(f"Loaded {len(self.devices)} devices from {self.devices_file}")
+        except Exception as e:
+            logger.error(f"Failed to reload devices: {e}")
 
     def add_device(self, device: Device):
         """Add a device and persist to disk."""
