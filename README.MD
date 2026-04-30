@@ -10,7 +10,7 @@ A powerful bot for remotely managing your devices via Wake-on-LAN, SSH, and powe
 
 ## 📷 Setup Preview
 
-*[setup visual/screenshot placeholder]*
+![image](https://media.discordapp.net/attachments/796655248629825536/1499502158238711879/Screenshot_2026-05-01_at_01.35.21.png?ex=69f507b5&is=69f3b635&hm=5c7f2531f84715ea8582a6b058916e28fb35d1662519489262c60002816559b3&=&format=webp&quality=lossless&width=1001&height=1591)
 
 ---
 
