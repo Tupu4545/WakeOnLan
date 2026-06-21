@@ -168,6 +168,31 @@ sudo visudo
 
 ---
 
+## 🛡️ Security & Reliability
+
+This bot contains advanced features to ensure secure operation and maximum reliability in production:
+
+### 1. HTTP Heartbeat Secret (`HEARTBEAT_SECRET`)
+To prevent unauthorized access or information disclosure to other devices on your local area network (LAN), you can configure a secret token. If set:
+- The `/devices.json` and `/message_state.json` HTTP failover sync endpoints will require a valid `X-Heartbeat-Secret` header.
+- Unauthorized requests will receive a `403 Forbidden` response.
+- Keeps your network configurations and device MAC addresses private.
+
+### 2. Smart Proxy Fallback (`PROXY_ONLY`)
+If you route bot connections through a SOCKS5 or HTTP proxy (e.g. to bypass local Telegram blocks in India or other regions):
+- The bot attempts to connect via the proxy first.
+- If the proxy is unavailable (e.g., your VPS is down), and `PROXY_ONLY=no` is configured, it automatically falls back to a direct connection natively to ensure uninterrupted control.
+- An email alert is triggered to notify you that the proxy has failed and the bot has fallen back.
+
+### 3. SMTP Transactional Email Alerts
+Configuring standard SMTP details enables the bot to email you in critical situations (e.g., using a free Gmail App Password, Brevo, or your own SMTP server):
+- **API Unreachable:** Notifies you immediately if Telegram or Discord API endpoints are blocked or offline.
+- **Wake-on-LAN Timeout:** Sends an email if a device is commanded to wake up but fails to respond to pings after 12 attempts (60 seconds).
+- **Power Command Failure:** Alerts you if a shutdown or sleep SSH command is executed successfully but the device remains online (still pingable), or if the SSH connection fails completely.
+- **Failover Takeover:** Notifies you when a backup node detects the primary is offline and takes over bot operations, or when the primary is restored.
+
+---
+
 ## 💡 Optimization & Troubleshooting Tips
 
 These are generalized tips derived from real-world deployments on constrained hardware (like Raspberry Pi Zeros):

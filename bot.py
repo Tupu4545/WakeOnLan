@@ -22,6 +22,7 @@ from telegram.ext import (
 from core.devices import Device, ConfigManager
 from core.executor import CommandExecutor
 from core.state import StateManager, format_time, format_duration, utcnow
+from core.notifier import EmailNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class TelegramBot:
         self.executor = executor
         self.state = state
         self.app = None
+        self.notifier = EmailNotifier(config)
 
     # ─── Message Builders ───────────────────────────────────────
 
@@ -411,6 +413,10 @@ class TelegramBot:
                         user_id, chat_id,
                         f"⚠️ {name}\n❌ Timeout — device did not respond", context
                     )
+                    self.notifier.send_alert(
+                        f"Wake-on-LAN Failure: {name}",
+                        f"Device '{name}' ({device.ip}) failed to respond to pings after sending Wake-on-LAN magic packet (12 attempts)."
+                    )
 
                 elif action == 'status':
                     await self.update_action(
@@ -458,14 +464,30 @@ class TelegramBot:
                             f"{emoji} {name}\n✅ {action.capitalize()} command sent", context
                         )
                         # Update stats after a delay
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(8)
                         online = await self.executor.ping_device(device.ip)
                         self.state.update_device_status(name, online)
                         await self.update_stats(user_id, context)
+                        
+                        # Verify state changed successfully
+                        if action == 'shutdown' and online:
+                            self.notifier.send_alert(
+                                f"Power Command Failure: Shutdown failed for {name}",
+                                f"Shutdown command was successfully sent to '{name}' ({device.ip}) but the device is still online and responding to pings."
+                            )
+                        elif action == 'sleep' and online:
+                            self.notifier.send_alert(
+                                f"Power Command Failure: Sleep failed for {name}",
+                                f"Sleep command was successfully sent to '{name}' ({device.ip}) but the device is still online and responding to pings."
+                            )
                     else:
                         await self.update_action(
                             user_id, chat_id,
                             f"❌ {name}\n{action.capitalize()} failed: {out}", context
+                        )
+                        self.notifier.send_alert(
+                            f"Power Command Error: {action.capitalize()} failed for {name}",
+                            f"Failed to execute SSH command '{action}' on device '{name}' ({device.ip}).\n\nCommand output:\n{out}"
                         )
 
             except Exception as e:
@@ -734,11 +756,29 @@ class TelegramBot:
 
     # ─── Bot Setup & Run ────────────────────────────────────────
 
-    def build_application(self):
+    def build_application(self, use_proxy: bool = True):
         """Build and configure the Telegram application."""
+        builder = ApplicationBuilder().token(self.config.telegram_token)
+
+        if use_proxy and self.config.proxy_enabled and self.config.proxy_url:
+            from telegram.request import HTTPXRequest
+            # Obfuscate proxy password in log if present
+            proxy_log_url = self.config.proxy_url
+            if "@" in proxy_log_url:
+                parts = proxy_log_url.split("@", 1)
+                protocol_creds = parts[0]
+                host_port = parts[1]
+                if "://" in protocol_creds:
+                    proto, creds = protocol_creds.split("://", 1)
+                    proxy_log_url = f"{proto}://[REDACTED]@{host_port}"
+                else:
+                    proxy_log_url = f"[REDACTED]@{host_port}"
+            logger.info(f"Configuring Telegram bot request proxy: {proxy_log_url}")
+            request = HTTPXRequest(proxy_url=self.config.proxy_url)
+            builder = builder.request(request)
+
         self.app = (
-            ApplicationBuilder()
-            .token(self.config.telegram_token)
+            builder
             .connect_timeout(30)
             .read_timeout(30)
             .write_timeout(30)
@@ -774,25 +814,55 @@ class TelegramBot:
 
     async def start_polling(self):
         """Start the bot polling with retry on network failures."""
-        app = self.build_application()
+        proxy_active = self.config.proxy_enabled and self.config.proxy_url
+        
+        # If proxy is active, try to start with proxy first
+        if proxy_active:
+            try:
+                app = self.build_application(use_proxy=True)
+                await app.initialize()
+                await app.start()
+                await app.updater.start_polling(drop_pending_updates=True)
+                logger.info("Telegram bot started polling (via proxy)")
+                return
+            except Exception as e:
+                logger.warning(f"Telegram connection failed via proxy: {e}")
+                self.notifier.send_alert(
+                    "Telegram Proxy Connection Failed",
+                    f"The Telegram bot failed to connect through the proxy: {self.config.proxy_url}\n\nError: {e}"
+                )
+                
+                if self.config.proxy_only:
+                    logger.error("PROXY_ONLY is enabled. Crashing.")
+                    raise
+                
+                logger.info("PROXY_ONLY is disabled. Retrying direct connection...")
+                # Continue below to try direct connection
+        
+        # Try direct connection
+        app = self.build_application(use_proxy=False)
         max_retries = 5
         for attempt in range(1, max_retries + 1):
             try:
                 await app.initialize()
                 await app.start()
                 await app.updater.start_polling(drop_pending_updates=True)
-                logger.info("Telegram bot started polling")
+                logger.info("Telegram bot started polling (direct connection)")
                 return
             except Exception as e:
                 if attempt < max_retries:
                     wait = attempt * 5
                     logger.warning(
-                        f"Telegram connect failed (attempt {attempt}/{max_retries}): {e}. "
+                        f"Telegram direct connect failed (attempt {attempt}/{max_retries}): {e}. "
                         f"Retrying in {wait}s..."
                     )
                     await asyncio.sleep(wait)
                 else:
-                    logger.error(f"Telegram connect failed after {max_retries} attempts: {e}")
+                    logger.error(f"Telegram direct connect failed after {max_retries} attempts: {e}")
+                    self.notifier.send_alert(
+                        "Telegram Bot Connection Failed",
+                        f"The Telegram bot failed to connect directly after {max_retries} attempts.\n\nError: {e}"
+                    )
                     raise
 
     async def stop_polling(self):

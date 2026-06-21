@@ -58,6 +58,18 @@ class ConfigManager:
         self.peer_ip: str = ""  # secondary IP if primary, primary IP if backup
         self.heartbeat_port: int = 12345
         self.monitor_interval: int = 30
+        # Proxy
+        self.proxy_enabled: bool = False
+        self.proxy_url: str = ""
+        self.proxy_only: bool = False
+        self.heartbeat_secret: str = ""
+        # Email Alerts
+        self.email_alerts_enabled: bool = False
+        self.email_smtp_server: str = ""
+        self.email_smtp_port: int = 587
+        self.email_sender: str = ""
+        self.email_receiver: str = ""
+        self.email_smtp_password: str = ""
 
     @property
     def node_name(self) -> str:
@@ -85,7 +97,7 @@ class ConfigManager:
 
         # Telegram
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        tg_users = os.getenv("TELEGRAM_AUTHORIZED_USERS", "")
+        tg_users = os.getenv("TELEGRAM_AUTHORIZED_USERS", "") or os.getenv("AUTHORIZED_USER_IDS", "")
         if tg_users:
             self.telegram_authorized_users = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()
@@ -110,6 +122,19 @@ class ConfigManager:
             self.peer_ip = os.getenv("PRIMARY_IP", "")
         self.heartbeat_port = int(os.getenv("HEARTBEAT_PORT", "12345"))
         self.monitor_interval = int(os.getenv("MONITOR_INTERVAL", "30"))
+
+        # Proxy
+        self.proxy_enabled = os.getenv("PROXY_ENABLED", "no").lower() in ("yes", "true", "1")
+        self.proxy_url = os.getenv("PROXY_URL", "")
+        self.proxy_only = os.getenv("PROXY_ONLY", "no").lower() in ("yes", "true", "1")
+        self.heartbeat_secret = os.getenv("HEARTBEAT_SECRET", "")
+        # Email Alerts
+        self.email_alerts_enabled = os.getenv("EMAIL_ALERTS_ENABLED", "no").lower() in ("yes", "true", "1")
+        self.email_smtp_server = os.getenv("EMAIL_SMTP_SERVER", "")
+        self.email_smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        self.email_sender = os.getenv("EMAIL_SENDER", "")
+        self.email_receiver = os.getenv("EMAIL_RECEIVER", "")
+        self.email_smtp_password = os.getenv("EMAIL_SMTP_PASSWORD", "")
 
         # Devices
         if self.devices_file.exists():

@@ -20,6 +20,7 @@ from discord.ext import commands
 from core.devices import Device, ConfigManager
 from core.executor import CommandExecutor
 from core.state import StateManager, format_time, utcnow
+from core.notifier import EmailNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +33,46 @@ class DiscordBot:
         self.config = config
         self.executor = executor
         self.state = state
+        self.notifier = EmailNotifier(config)
+        self.bot = None
+        self.build_bot(use_proxy=True)
 
+    def build_bot(self, use_proxy: bool = True):
         # Minimal intents: no message content needed for button/slash interactions
         intents = discord.Intents.default()
-        self.bot = commands.Bot(
-            command_prefix="!", intents=intents,
-            help_command=None
-        )
+        
+        kwargs = {
+            "command_prefix": "!",
+            "intents": intents,
+            "help_command": None
+        }
+
+        if use_proxy and self.config.proxy_enabled and self.config.proxy_url:
+            proxy_url = self.config.proxy_url
+            proxy_log_url = proxy_url
+            if "@" in proxy_log_url:
+                parts = proxy_log_url.split("@", 1)
+                protocol_creds = parts[0]
+                host_port = parts[1]
+                if "://" in protocol_creds:
+                    proto, creds = protocol_creds.split("://", 1)
+                    proxy_log_url = f"{proto}://[REDACTED]@{host_port}"
+                else:
+                    proxy_log_url = f"[REDACTED]@{host_port}"
+
+            if proxy_url.startswith(("socks4://", "socks5://", "socks5h://")):
+                logger.info(f"Configuring Discord bot SOCKS5 proxy connector: {proxy_log_url}")
+                try:
+                    from aiohttp_socks import ProxyConnector
+                    connector = ProxyConnector.from_url(proxy_url)
+                    kwargs["connector"] = connector
+                except ImportError:
+                    logger.error("aiohttp-socks not installed. Cannot use SOCKS proxy for Discord bot.")
+            else:
+                logger.info(f"Configuring Discord bot HTTP/HTTPS proxy: {proxy_log_url}")
+                kwargs["proxy"] = proxy_url
+
+        self.bot = commands.Bot(**kwargs)
         self._setup_bot()
 
     def _setup_bot(self):
@@ -313,12 +347,58 @@ class DiscordBot:
         await self.update_stats()
 
     async def start(self):
-        """Start the Discord bot."""
-        await self.bot.start(self.config.discord_token)
+        """Start the Discord bot with proxy fallback retry."""
+        proxy_active = self.config.proxy_enabled and self.config.proxy_url
+        
+        # If proxy is active, try to start with proxy first
+        if proxy_active:
+            try:
+                logger.info("Attempting to start Discord bot (via proxy)...")
+                await self.bot.start(self.config.discord_token)
+                return
+            except Exception as e:
+                logger.warning(f"Discord connection failed via proxy: {e}")
+                self.notifier.send_alert(
+                    "Discord Proxy Connection Failed",
+                    f"The Discord bot failed to connect through the proxy: {self.config.proxy_url}\n\nError: {e}"
+                )
+                
+                if self.config.proxy_only:
+                    logger.error("PROXY_ONLY is enabled. Crashing.")
+                    raise
+                
+                logger.info("PROXY_ONLY is disabled. Retrying direct connection...")
+                # Rebuild bot without proxy
+                self.build_bot(use_proxy=False)
+        
+        # Try direct connection
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Attempting to start Discord bot (direct connection, attempt {attempt}/{max_retries})...")
+                await self.bot.start(self.config.discord_token)
+                return
+            except Exception as e:
+                if attempt < max_retries:
+                    wait = attempt * 5
+                    logger.warning(
+                        f"Discord direct connect failed (attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    self.build_bot(use_proxy=False)
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Discord direct connect failed after {max_retries} attempts: {e}")
+                    self.notifier.send_alert(
+                        "Discord Bot Connection Failed",
+                        f"The Discord bot failed to connect directly after {max_retries} attempts.\n\nError: {e}"
+                    )
+                    raise
 
     async def stop(self):
         """Stop the Discord bot."""
-        await self.bot.close()
+        if self.bot:
+            await self.bot.close()
 
 
 class PanelView(discord.ui.View):
@@ -451,6 +531,10 @@ class PanelButton(discord.ui.Button):
                 await self.dbot.update_action(f"🟢 {name}\n🔍 Pinging... ({i+1}/12)", user_id=target_uid)
                 await asyncio.sleep(5)
             await self.dbot.update_action(f"⚠️ {name}\n❌ Timeout — device did not respond", user_id=target_uid)
+            self.dbot.notifier.send_alert(
+                f"Wake-on-LAN Failure: {name}",
+                f"Device '{name}' ({device.ip}) failed to respond to pings after sending Wake-on-LAN magic packet (12 attempts)."
+            )
 
         elif action == "status":
             await self.dbot.update_action(f"🔍 {name}\n⏳ Checking...", user_id=target_uid)
@@ -470,15 +554,35 @@ class PanelButton(discord.ui.Button):
                 'sleep': self.dbot.executor.get_sleep_command(device),
             }
             cmd = cmd_map.get(action, "")
+            if not cmd:
+                await self.dbot.update_action(f"❌ {action.capitalize()} not supported for {device.os}", user_id=target_uid)
+                return
+            
             emoji = {'shutdown': '🛑', 'restart': '🔄', 'sleep': '💤'}[action]
             
             await self.dbot.update_action(f"{emoji} {name}\n⏳ Sending {action}...", user_id=target_uid)
             ok, out = await self.dbot.executor.ssh_command(device, cmd)
             if ok or action in ('shutdown', 'restart'):
                 await self.dbot.update_action(f"{emoji} {name}\n✅ {action.capitalize()} command sent", user_id=target_uid)
-                await asyncio.sleep(5)
+                await asyncio.sleep(8)
                 online = await self.dbot.executor.ping_device(device.ip)
                 self.dbot.state.update_device_status(name, online)
                 await self.dbot.update_stats()
+                
+                # Verify state changed successfully
+                if action == 'shutdown' and online:
+                    self.dbot.notifier.send_alert(
+                        f"Power Command Failure: Shutdown failed for {name}",
+                        f"Shutdown command was successfully sent to '{name}' ({device.ip}) but the device is still online and responding to pings."
+                    )
+                elif action == 'sleep' and online:
+                    self.dbot.notifier.send_alert(
+                        f"Power Command Failure: Sleep failed for {name}",
+                        f"Sleep command was successfully sent to '{name}' ({device.ip}) but the device is still online and responding to pings."
+                    )
             else:
                 await self.dbot.update_action(f"❌ {name}\n{action.capitalize()} failed: {out}", user_id=target_uid)
+                self.dbot.notifier.send_alert(
+                    f"Power Command Error: {action.capitalize()} failed for {name}",
+                    f"Failed to execute SSH command '{action}' on device '{name}' ({device.ip}).\n\nCommand output:\n{out}"
+                )

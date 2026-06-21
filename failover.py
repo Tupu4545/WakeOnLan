@@ -13,6 +13,7 @@ import signal
 import urllib.request
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from core.notifier import EmailNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,16 @@ class HeartbeatServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                # Verify secret if configured
+                if parent.config.heartbeat_secret:
+                    incoming_secret = self.headers.get('X-Heartbeat-Secret', '')
+                    if incoming_secret != parent.config.heartbeat_secret:
+                        logger.warning(f"Unauthorized heartbeat request from {self.client_address[0]}")
+                        self.send_response(403)
+                        self.end_headers()
+                        self.wfile.write(b"Forbidden: Invalid secret token")
+                        return
+
                 if self.path == '/devices.json':
                     try:
                         with open(parent.config.devices_file, 'rb') as f:
@@ -110,6 +121,7 @@ class FailoverWatcher:
         self._task = None
         self.on_primary_down = None  # async callback
         self.on_primary_up = None    # async callback
+        self.notifier = EmailNotifier(config)
 
     async def start(self):
         """Start watching the primary."""
@@ -142,6 +154,11 @@ class FailoverWatcher:
                     if self._primary_is_down:
                         self._primary_is_down = False
                         logger.info("Primary is back online!")
+                        self.notifier.send_alert(
+                            "Failover Event: Primary Node Restored",
+                            f"The primary node ({self.primary_ip}) has returned online.\n"
+                            f"Backup node ({self.config.node_name}) is relinquishing control and stopping bot services."
+                        )
                         if self.on_primary_up:
                             await self.on_primary_up()
                     
@@ -156,6 +173,11 @@ class FailoverWatcher:
                             and not self._primary_is_down):
                         self._primary_is_down = True
                         logger.warning("Primary is DOWN! Taking over...")
+                        self.notifier.send_alert(
+                            "Failover Event: Primary Node Offline",
+                            f"The primary node ({self.primary_ip}) is offline (failed {self.fail_threshold} consecutive heartbeat checks).\n"
+                            f"Backup node ({self.config.node_name}) is taking over and starting bot services."
+                        )
                         if self.on_primary_down:
                             await self.on_primary_down()
 
@@ -174,9 +196,16 @@ class FailoverWatcher:
         loop = asyncio.get_event_loop()
         try:
             url = f"http://{self.primary_ip}:{self.port}"
-            await loop.run_in_executor(
-                None, lambda: urllib.request.urlopen(url, timeout=3)
-            )
+            headers = {}
+            if self.config.heartbeat_secret:
+                headers['X-Heartbeat-Secret'] = self.config.heartbeat_secret
+            
+            def fetch():
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    return response.read()
+                    
+            await loop.run_in_executor(None, fetch)
             return True
         except Exception:
             return False
@@ -185,6 +214,10 @@ class FailoverWatcher:
         """Fetch json files from primary and compare before saving to prevent SD card wear."""
         loop = asyncio.get_event_loop()
         
+        headers = {}
+        if self.config.heartbeat_secret:
+            headers['X-Heartbeat-Secret'] = self.config.heartbeat_secret
+
         for path, file_path, reload_func in [
             ('/devices.json', self.config.devices_file, self.config.reload_devices),
             ('/message_state.json', self.state.state_file, self.state.load)
@@ -192,7 +225,8 @@ class FailoverWatcher:
             try:
                 url = f"http://{self.primary_ip}:{self.port}{path}"
                 def fetch():
-                    with urllib.request.urlopen(url, timeout=3) as response:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=3) as response:
                         return response.read()
                 
                 content = await loop.run_in_executor(None, fetch)
