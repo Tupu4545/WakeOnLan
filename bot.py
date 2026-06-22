@@ -774,8 +774,7 @@ class TelegramBot:
                 else:
                     proxy_log_url = f"[REDACTED]@{host_port}"
             logger.info(f"Configuring Telegram bot request proxy: {proxy_log_url}")
-            request = HTTPXRequest(proxy_url=self.config.proxy_url)
-            builder = builder.request(request)
+            builder = builder.proxy(self.config.proxy_url)
 
         self.app = (
             builder
